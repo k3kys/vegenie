@@ -42,7 +42,7 @@ class MonitoringService:
         db = SessionLocal()
         try:
             # 기준: 현재시간 - 5분
-            threshold = datetime.now() - timedelta(minutes=5)
+            threshold = datetime.now() - timedelta(minutes=60)
 
             # 디버깅: 서버 시간 확인
             # print(f"[Monitoring] Checking at {datetime.now()} (Threshold: {threshold})")
