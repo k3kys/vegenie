@@ -30,7 +30,7 @@ class Settings(BaseSettings):
     KAKAO_TEMPLATE_ID: str = "KA01TP2512271353576383sumVHXbRGu"
 
     # Phone Numbers
-    MANAGER_PHONE: str = "01089993264"  # 수신자
+    MANAGER_PHONE: str = "01021123558"  # 수신자
     SENDER_PHONE: str = "01021123558"  # 발신자 (Solapi에 등록된 번호여야 함)
 
     # [수정] 환경변수 'DATABASE_URL'이 있으면 그걸 쓰고, 없으면 기존 SQLite 사용 (로컬 테스트용)
