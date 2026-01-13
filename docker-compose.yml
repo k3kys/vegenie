@@ -1,0 +1,40 @@
+version: '3.8'
+
+services:
+  # 1. PostgreSQL 데이터베이스
+  db:
+    image: postgres:15-alpine
+    container_name: vegenie-db
+    restart: always
+    environment:
+      - POSTGRES_USER=vegenie_user
+      - POSTGRES_PASSWORD=vegenie_pass
+      - POSTGRES_DB=vegenie_db
+      - TZ=Asia/Seoul
+    volumes:
+      - postgres_data:/var/lib/postgresql/data  # DB 데이터 영구 저장
+    ports:
+      - "5432:5432"  # (선택) 로컬에서 DB 접속하고 싶을 때
+
+  # 2. Vegenie 서버
+  backend:
+    build: .
+    container_name: vegenie-server
+    restart: always
+    depends_on:
+      - db
+    ports:
+      - "8000:8000"
+    environment:
+      # [중요] Postgres 연결 문자열 (user:pass@container_name:port/db_name)
+      - DATABASE_URL=postgresql://vegenie_user:vegenie_pass@db:5432/vegenie_db
+
+      # [설정] 기존 키 값들 (settings.py가 이걸 읽음)
+      - SECRET_KEY=vegenie-secret-key-prod-change-me
+      - SOLAPI_KEY=NCS4COIDQ681XXPL
+      - SOLAPI_SECRET=4IWZDH2PMMQJXBZRDRA5Z7SQUTP8VFSX
+      - TIMEZONE=Asia/Seoul
+      - TZ=Asia/Seoul
+
+volumes:
+  postgres_data:

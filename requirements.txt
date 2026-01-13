@@ -1,0 +1,17 @@
+fastapi
+uvicorn
+sqlalchemy
+pydantic
+pydantic-settings
+python-jose[cryptography]
+python-multipart
+requests
+openpyxl
+pandas
+msoffcrypto-tool
+apscheduler
+psycopg2-binary
+
+# [수정] passlib와 bcrypt 버전을 분리해서 명시
+passlib
+bcrypt==4.0.1
