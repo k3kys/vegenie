@@ -33,8 +33,15 @@ class Token(BaseModel):
 class UserUpdate(BaseModel):
     phone: Optional[str] = None
     store_name: Optional[str] = None
+    username: Optional[str] = None  # [추가] 아이디 변경 허용
+    password: Optional[str] = None  # [추가] 비밀번호 변경 허용
 
-    # 그 외 필드(username, role 등)가 들어오면 에러를 뱉거나 무시하도록 설정
-    # 명세의 "변경 거부"를 확실히 하기 위해, Pydantic 레벨에서 필터링합니다.
     class Config:
         extra = "forbid"  # 정의되지 않은 필드가 오면 422 Unprocessable Entity 발생 (사실상 거부)
+
+class FindIdRequest(BaseModel):
+    phone: str
+
+class ResetPasswordRequest(BaseModel):
+    username: str
+    phone: str

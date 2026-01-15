@@ -5,17 +5,19 @@ import hmac
 import hashlib
 import uuid
 from sqlalchemy.orm import Session
+
+# 프로젝트 내부 모듈 임포트
 from app.models.models import ReportNotification, User, SalesReport, SystemLog
 from app.settings import settings
 
 
 class NotificationService:
     # ------------------------------------------------------------------
-    # [1] 알림톡 관련 로직 (일일 매출 보고 -> 관리자에게 전송)
+    # [공통] Solapi API 인증 헤더 생성기
     # ------------------------------------------------------------------
     @staticmethod
     def _get_solapi_header():
-        """알림톡용 헤더 생성기"""
+        """알림톡 및 SMS 발송을 위한 HMAC-SHA256 인증 헤더 생성"""
         date_str = datetime.datetime.now(datetime.timezone.utc).isoformat()
         salt = str(uuid.uuid4())
         data = date_str + salt
@@ -24,11 +26,15 @@ class NotificationService:
             msg=data.encode("utf-8"),
             digestmod=hashlib.sha256
         ).hexdigest()
+
         return {
             "Authorization": f"HMAC-SHA256 apiKey={settings.SOLAPI_KEY}, date={date_str}, salt={salt}, signature={signature}",
             "Content-Type": "application/json"
         }
 
+    # ------------------------------------------------------------------
+    # [1] 알림톡 관련 로직 (일일 매출 보고 -> 관리자에게 전송)
+    # ------------------------------------------------------------------
     @staticmethod
     def send_daily_report(db: Session, user: User, report: SalesReport):
         """
@@ -61,12 +67,11 @@ class NotificationService:
             db.add(notif)
 
         try:
-            # 알림톡 발송 로직
             url = "https://api.solapi.com/messages/v4/send"
             headers = NotificationService._get_solapi_header()
             data = {
                 "message": {
-                    "to": settings.MANAGER_PHONE,  # [유지] 매출 리포트는 관리자에게
+                    "to": settings.MANAGER_PHONE,
                     "from": settings.SENDER_PHONE,
                     "text": body,
                     "kakaoOptions": {
@@ -83,7 +88,6 @@ class NotificationService:
             notif.provider_message_id = resp.get("messageId")
             notif.updated_at = datetime.datetime.now()
 
-            # 시스템 로그 기록
             db.add(SystemLog(type="ALIMTALK", level="INFO", source="SERVER", message="Daily report sent",
                              status="SUCCESS"))
             print(f"[ALIMTALK SUCCESS] MessageId: {resp.get('messageId')}")
@@ -111,7 +115,6 @@ class NotificationService:
         """
         print(f"\n=== 🧟 좀비 알림 발송 시작 (To Owner) ===")
 
-        # [안전장치] 사장님 전화번호가 없는 경우 처리
         if not user.phone:
             error_msg = f"User {user.username} ({user.store_name}) has no phone number."
             print(f"[ZOMBIE FAIL] {error_msg}")
@@ -119,50 +122,26 @@ class NotificationService:
             db.commit()
             return False
 
-        # [메시지 내용]
         text_body = f"[{user.store_name}] 베지나이가 종료되었습니다. 다시 켜주세요."
 
         try:
-            # (1) 헤더 생성
-            date_str = datetime.datetime.now(datetime.timezone.utc).isoformat()
-            salt = str(uuid.uuid4())
-            data = date_str + salt
-            signature = hmac.new(
-                key=settings.SOLAPI_SECRET.encode("utf-8"),
-                msg=data.encode("utf-8"),
-                digestmod=hashlib.sha256
-            ).hexdigest()
-
-            headers = {
-                "Authorization": f"HMAC-SHA256 apiKey={settings.SOLAPI_KEY}, date={date_str}, salt={salt}, signature={signature}",
-                "Content-Type": "application/json"
-            }
-
-            # (2) 페이로드 구성
+            url = "https://api.solapi.com/messages/v4/send"
+            headers = NotificationService._get_solapi_header()
             body = {
                 "message": {
-                    "to": user.phone,  # [수정됨] 사장님 본인 휴대폰 번호
-                    "from": settings.SENDER_PHONE,  # 발신자는 설정된 번호 (대표번호 등)
+                    "to": user.phone,
+                    "from": settings.SENDER_PHONE,
                     "text": text_body,
                     "type": "SMS"
                 }
             }
 
-            # [디버깅]
-            print(f"   - From: {settings.SENDER_PHONE}")
-            print(f"   - To: {user.phone} (사장님)")
-            print(f"   - Text: {text_body}")
-
-            # (3) 발송
-            url = "https://api.solapi.com/messages/v4/send"
             res = requests.post(url, headers=headers, json=body)
 
             if res.status_code != 200:
                 raise Exception(f"Solapi API Error: {res.text}")
 
             resp = res.json()
-
-            # 로그 기록
             db.add(SystemLog(
                 type="ZOMBIE_SMS",
                 level="WARN",
@@ -179,4 +158,31 @@ class NotificationService:
             print(f"[ZOMBIE SMS FAIL] {str(e)}")
             db.add(SystemLog(type="ZOMBIE_SMS", level="ERROR", source="SERVER", message=str(e), status="FAIL"))
             db.commit()
+            return False
+
+    # ------------------------------------------------------------------
+    # [3] 공통 SMS 발송 함수 (아이디/비번 찾기용)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def send_generic_sms(phone: str, text: str) -> bool:
+        """
+        아이디 찾기나 임시 비밀번호 발급과 같은 일반 SMS 발송을 처리합니다.
+        """
+        try:
+            url = "https://api.solapi.com/messages/v4/send"
+            headers = NotificationService._get_solapi_header()
+            body = {
+                "message": {
+                    "to": phone,
+                    "from": settings.SENDER_PHONE,
+                    "text": text,
+                    "type": "SMS"
+                }
+            }
+
+            res = requests.post(url, headers=headers, json=body)
+            return res.status_code == 200
+
+        except Exception as e:
+            print(f"[GENERIC SMS FAIL] {str(e)}")
             return False

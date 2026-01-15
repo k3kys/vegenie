@@ -1,0 +1,1482 @@
+[Server Code Snapshot]
+Date: 01/14/2026 09:41:54
+==============================================================================
+
+
+==============================================================================
+?? FILE: \docker-compose.yml
+==============================================================================
+version: '3.8'
+
+services:
+  # 1. PostgreSQL ?°ì´?°ë² ?´ìŠ¤
+  db:
+    image: postgres:15-alpine
+    container_name: vegenie-db
+    restart: always
+    environment:
+      - POSTGRES_USER=vegenie_user
+      - POSTGRES_PASSWORD=vegenie_pass
+      - POSTGRES_DB=vegenie_db
+      - TZ=Asia/Seoul
+    volumes:
+      - postgres_data:/var/lib/postgresql/data  # DB ?°ì´???êµ¬ ?€??
+    ports:
+      - "5432:5432"  # (? íƒ) ë¡œì»¬?ì„œ DB ?‘ì†?˜ê³  ?¶ì„ ??
+
+  # 2. Vegenie ?œë²„
+  backend:
+    build: .
+    container_name: vegenie-server
+    restart: always
+    depends_on:
+      - db
+    ports:
+      - "8000:8000"
+    environment:
+      # [ì¤‘ìš”] Postgres ?°ê²° ë¬¸ì??(user:pass@container_name:port/db_name)
+      - DATABASE_URL=postgresql://vegenie_user:vegenie_pass@db:5432/vegenie_db
+
+      # [?¤ì •] ê¸°ì¡´ ??ê°’ë“¤ (settings.pyê°€ ?´ê±¸ ?½ìŒ)
+      - SECRET_KEY=vegenie-secret-key-prod-change-me
+      - SOLAPI_KEY=NCS4COIDQ681XXPL
+      - SOLAPI_SECRET=4IWZDH2PMMQJXBZRDRA5Z7SQUTP8VFSX
+      - TIMEZONE=Asia/Seoul
+      - TZ=Asia/Seoul
+
+volumes:
+  postgres_data:
+
+
+==============================================================================
+?? FILE: \init_db.py
+==============================================================================
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
+from app.db import Base, engine
+from app.models.models import User, SalesReport
+
+def init_db():
+    print("Vegenie DB ÃÊ±âÈ­ Áß...")
+    Base.metadata.create_all(bind=engine)
+    print("Å×ÀÌºí »ı¼º ¿Ï·á: users, sales_reports")
+
+if __name__ == "__main__":
+    init_db()
+
+
+
+==============================================================================
+?? FILE: \app\db.py
+==============================================================================
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker, declarative_base # [¼öÁ¤] ÃÖ½Å ¹öÀü¿¡ ¸ÂÃç import ¹æ½Ä Á¶Á¤
+from .settings import settings
+
+# [¼öÁ¤] SQLiteÀÏ ¶§¸¸ check_same_thread ¿É¼Ç Àû¿ë
+connect_args = {}
+if settings.DATABASE_URL.startswith("sqlite"):
+    connect_args = {"check_same_thread": False}
+
+engine = create_engine(settings.DATABASE_URL, connect_args=connect_args)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+==============================================================================
+?? FILE: \app\main.py
+==============================================================================
+import uvicorn
+from contextlib import asynccontextmanager
+from fastapi import FastAPI
+from apscheduler.schedulers.background import BackgroundScheduler
+from app.routers import system, auth, users, sales
+from app.settings import settings
+from app.services.monitoring import MonitoringService
+
+# ½ºÄÉÁÙ·¯ ¼³Á¤
+scheduler = BackgroundScheduler(timezone=settings.TIMEZONE)
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # ¾Û ½ÃÀÛ ½Ã ½ºÄÉÁÙ·¯ ½ÃÀÛ
+    scheduler.add_job(MonitoringService.check_zombies, 'interval', minutes=1, id='check_zombies')
+    scheduler.add_job(MonitoringService.daily_reset, 'cron', hour=0, minute=5, id='daily_reset')
+    scheduler.start()
+    print("--- [System] Monitoring Scheduler Started ---")
+    yield
+    scheduler.shutdown()
+    print("--- [System] Monitoring Scheduler Shutdown ---")
+
+app = FastAPI(title=settings.PROJECT_NAME, lifespan=lifespan)
+
+# [¼öÁ¤µÊ] system ¶ó¿ìÅÍÀÇ prefix¸¦ '/api/v1'À¸·Î º¯°æ (±âÁ¸ '/api/v1/system' Á¦°Å)
+app.include_router(system.router, prefix=settings.API_V1_STR, tags=["System & Reports"])
+
+# ³ª¸ÓÁö ¶ó¿ìÅÍ´Â ±âÁ¸ À¯Áö
+app.include_router(auth.router, prefix=f"{settings.API_V1_STR}/auth", tags=["auth"])
+app.include_router(users.router, prefix=f"{settings.API_V1_STR}/users", tags=["users"])
+app.include_router(sales.router, prefix=f"{settings.API_V1_STR}/sales", tags=["sales"])
+
+@app.get("/")
+def root():
+    return {"message": "Vegenie API Server is running"}
+
+if __name__ == "__main__":
+    uvicorn.run("app.main:app", host="0.0.0.0", port=8000, reload=True)
+
+
+==============================================================================
+?? FILE: \app\settings.py
+==============================================================================
+from pydantic_settings import BaseSettings
+import os # [Ãß°¡]
+
+class Settings(BaseSettings):
+    PROJECT_NAME: str = "Vegenie"
+    VERSION: str = "v0.2.5"
+    API_V1_STR: str = "/api/v1"
+
+    TIMEZONE: str = "Asia/Seoul"
+    DATABASE_URL: str = "sqlite:///./vegenie.db"
+
+    # ¿¢¼¿ ÆÄ½Ì °è¾à
+    EXCEL_PASSWORD: str = "7055"
+    EXCEL_SHEET_NAME: str = "°áÁ¦ ÇÕ°è"
+
+    # JWT ¼³Á¤
+    SECRET_KEY: str = "vegenie-secret-key-change-this-in-prod"
+    ALGORITHM: str = "HS256"
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24 * 7
+
+    # --------------------------------------------------------
+    # [G. ¾Ë¸²/¿î¿µ °íÁ¤°ª] - Solapi & Kakao Real Keys
+    # --------------------------------------------------------
+    # Solapi API Key
+    SOLAPI_KEY: str = "NCS4COIDQ681XXPL"
+    SOLAPI_SECRET: str = "4IWZDH2PMMQJXBZRDRA5Z7SQUTP8VFSX"
+
+    # Kakao AlimTalk IDs
+    KAKAO_PF_ID: str = "KA01PF251225055208641PWbN0JWVOo8"
+    KAKAO_TEMPLATE_ID: str = "KA01TP2512271353576383sumVHXbRGu"
+
+    # Phone Numbers
+    MANAGER_PHONE: str = "01089993264"  # ¼ö½ÅÀÚ
+    SENDER_PHONE: str = "01021123558"  # ¹ß½ÅÀÚ (Solapi¿¡ µî·ÏµÈ ¹øÈ£¿©¾ß ÇÔ)
+
+    # [¼öÁ¤] È¯°æº¯¼ö 'DATABASE_URL'ÀÌ ÀÖÀ¸¸é ±×°É ¾²°í, ¾øÀ¸¸é ±âÁ¸ SQLite »ç¿ë (·ÎÄÃ Å×½ºÆ®¿ë)
+    DATABASE_URL: str = os.getenv("DATABASE_URL", "sqlite:///./vegenie.db")
+
+settings = Settings()
+
+
+==============================================================================
+?? FILE: \app\__init__.py
+==============================================================================
+
+
+==============================================================================
+?? FILE: \app\controllers\auth_controller.py
+==============================================================================
+# app/controllers/auth_controller.py
+from sqlalchemy.orm import Session
+from fastapi import HTTPException, status
+from app.models.models import User
+from app.schemas.user_schema import UserCreate, UserLogin
+from app.core.security import get_password_hash, verify_password, create_access_token
+from app.settings import settings
+from datetime import timedelta
+from datetime import datetime
+
+class AuthController:
+    @staticmethod
+    def register_user(db: Session, user_in: UserCreate):
+        # 1. Username ì¤‘ë³µ ì²´í¬
+        existing_user = db.query(User).filter(User.username == user_in.username).first()
+        if existing_user:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Username already exists"
+            )
+
+        # 2. ë¹„ë?ë²ˆí˜¸ ?´ì‹± ë°?User ê°ì²´ ?ì„±
+        # [cite_start]store_uuid??Model??default=uuid.uuid4()???˜í•´ ?ë™ ?ì„± (?œë²„ ê¶Œìœ„) [cite: 19]
+        db_user = User(
+            username=user_in.username,
+            password_hash=get_password_hash(user_in.password),
+            phone=user_in.phone,
+            store_name=user_in.store_name,
+            role="OWNER"
+        )
+
+        db.add(db_user)
+        db.commit()
+        db.refresh(db_user)
+        return db_user
+
+    @staticmethod
+    def login_user(db: Session, user_in: UserLogin):
+        # 1. ? ì? ì¡°íšŒ
+        user = db.query(User).filter(User.username == user_in.username).first()
+        if not user:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Incorrect username or password",
+            )
+
+        # 2. ë¹„ë?ë²ˆí˜¸ ê²€ì¦?
+        if not verify_password(user_in.password, user.password_hash):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Incorrect username or password",
+            )
+
+        # 3. ? í° ë°œê¸‰
+        access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+        access_token = create_access_token(
+            data={"sub": user.username, "user_id": user.id},  # user_id ?¬í•¨
+            expires_delta=access_token_expires
+        )
+
+        return {
+            "access_token": access_token,
+            "token_type": "bearer"
+        }
+
+    @staticmethod
+    def process_heartbeat(db: Session, current_user: User):
+        # 1. ë§ˆì?ë§??˜ì‹  ?œê°„ ê°±ì‹ 
+        current_user.last_heartbeat = datetime.now()
+
+        # 2. ì¢€ë¹??íƒœ?€?¤ë©´ ?´ì œ (?¬ìˆ˜????is_offline_notified=False)
+        if current_user.is_offline_notified:
+            current_user.is_offline_notified = False
+
+            # (? íƒ) ë³µêµ¬ ë¡œê·¸ ?¨ê¸°ê¸?
+            # MonitoringService.log_event(...)
+
+        db.add(current_user)
+        db.commit()
+        db.refresh(current_user)
+
+        return {
+            "status": "alive",
+            "last_heartbeat": str(current_user.last_heartbeat)
+        }
+
+
+==============================================================================
+?? FILE: \app\controllers\sales_controller.py
+==============================================================================
+# app/controllers/sales_controller.py
+from datetime import date
+from sqlalchemy.orm import Session
+from fastapi import UploadFile, HTTPException
+from app.models.models import User, SalesReport, SystemLog
+from app.services.parser import ExcelParser
+from app.services.notification import NotificationService
+
+class SalesController:
+    @staticmethod
+    async def upload_sales(db: Session, current_user: User, file: UploadFile, report_date: date = None):
+        # -------------------------------------------------------
+        # [cite_start]Step 1) report_date ?•ì •/ê²€ì¦?(?œë²„ ê¶Œìœ„) [cite: 21]
+        # -------------------------------------------------------
+        server_today = date.today()
+
+        if report_date is None:
+            # ë¯¸ì œê³????œë²„ todayë¡??•ì •
+            final_date = server_today
+        else:
+            # ?œê³µ ??ê²€ì¦? ë¶ˆì¼ì¹?400
+            if report_date != server_today:
+                raise HTTPException(status_code=400, detail="Report date must match server today.")
+            final_date = report_date
+
+        # -------------------------------------------------------
+        # Step 2~5) ?‘ì? ?Œì‹± (ê¸°ì¡´ ë¡œì§ ?™ì¼)
+        # -------------------------------------------------------
+        try:
+            parsed = await ExcelParser.parse_sales_file(file)
+        except HTTPException as he:
+            raise he  # 400 ?ëŸ¬??ê·¸ë?ë¡??„ë‹¬
+        except Exception as e:
+            db.add(SystemLog(type="UPLOAD", level="ERROR", source="SERVER", message=f"Parse Error: {str(e)}",
+                             status="FAIL"))
+            db.commit()
+            raise HTTPException(status_code=400, detail="Excel parsing failed")
+
+        # -------------------------------------------------------
+        # [cite_start]Step 7) Total ?¬ê³„??(SSOT) [cite: 9]
+        # -------------------------------------------------------
+        total = parsed["hall"] + parsed["baemin"] + parsed["coupang"] + parsed["yogiyo"]
+
+        # -------------------------------------------------------
+        # [cite_start]Step 6) sales_reports upsert [cite: 21]
+        # -------------------------------------------------------
+        report = db.query(SalesReport).filter(
+            SalesReport.user_id == current_user.id,
+            SalesReport.report_date == final_date
+        ).first()
+
+        if not report:
+            report = SalesReport(user_id=current_user.id, report_date=final_date)
+
+        report.hall = parsed["hall"]
+        report.baemin = parsed["baemin"]
+        report.coupang = parsed["coupang"]
+        report.yogiyo = parsed["yogiyo"]
+        report.total_sales = total
+
+        db.add(report)
+        db.commit()
+        db.refresh(report)  # ID ?ë“
+
+        # -------------------------------------------------------
+        # [cite_start]Step 8) report_notifications + ?Œë¦¼??ë°œì†¡ [cite: 16]
+        # ?•ì±…: ?Œë¦¼ ?¤íŒ¨?´ë„ ?…ë¡œ?œëŠ” 200 ? ì? (Try-Except ?´ë? ì²˜ë¦¬)
+        # -------------------------------------------------------
+        NotificationService.send_daily_report(db, current_user, report)
+
+        # -------------------------------------------------------
+        # [cite_start]Step 9) System Log [cite: 21]
+        # -------------------------------------------------------
+        db.add(SystemLog(
+            type="UPLOAD",
+            level="INFO",
+            source="SERVER",
+            message="Upload & Parsing Success",
+            status="SUCCESS",
+            meta=f'{{"report_id": {report.report_id}, "total": {total}}}'
+        ))
+        db.commit()
+
+        return report
+
+    @staticmethod
+    def _log(db, level, msg, user):
+        # ?œìŠ¤??ë¡œê·¸ ?ì¬ ?¬í¼ (ëª¨ë¸??SystemLogê°€ ?ˆì–´????
+        try:
+            log = SystemLog(
+                type="UPLOAD",
+                level=level,
+                source="SERVER",
+                message=msg,
+                status="SUCCESS" if level == "INFO" else "FAIL",
+                meta=f'{{"user_id": {user.id}}}'
+            )
+            db.add(log)
+            # ?¬ê¸°??commit?€ ë©”ì¸ ?¸ëœ??…˜ê³??¨ê»˜ ì²˜ë¦¬?˜ë„ë¡???
+        except:
+            pass  # ë¡œê·¸ ?¤íŒ¨ê°€ ë¡œì§??ë§‰ì? ?Šê²Œ
+
+
+==============================================================================
+?? FILE: \app\controllers\user_controller.py
+==============================================================================
+# app/controllers/user_controller.py
+from sqlalchemy.orm import Session
+from fastapi import HTTPException, status
+from app.models.models import User
+from app.schemas.user_schema import UserUpdate
+
+
+class UserController:
+    @staticmethod
+    def get_me(current_user: User):
+        # ?„ì¬ ë¡œê·¸?¸í•œ ?¬ìš©??ê°ì²´ ë°˜í™˜
+        return current_user
+
+    @staticmethod
+    def update_profile(db: Session, current_user: User, user_in: UserUpdate):
+        # ëª…ì„¸: phone/store_nameë§?ë³€ê²??ˆìš© (?”ì´?¸ë¦¬?¤íŠ¸)
+        # ?¤í‚¤ë§?UserUpdate)?ì„œ ?´ë? ?„í„°ë§ë˜ì§€ë§? ë¡œì§?ì„œ??ëª…ì‹œ?ìœ¼ë¡?ì²˜ë¦¬
+
+        updates_made = False
+
+        if user_in.phone is not None:
+            current_user.phone = user_in.phone
+            updates_made = True
+
+        if user_in.store_name is not None:
+            current_user.store_name = user_in.store_name
+            updates_made = True
+
+        if updates_made:
+            db.add(current_user)
+            db.commit()
+            db.refresh(current_user)
+
+        return current_user
+
+
+==============================================================================
+?? FILE: \app\controllers\__init__.py
+==============================================================================
+
+
+==============================================================================
+?? FILE: \app\core\deps.py
+==============================================================================
+# app/core/deps.py
+from typing import Generator, Optional
+from fastapi import Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordBearer
+from jose import jwt, JWTError
+from sqlalchemy.orm import Session
+from app.db import get_db
+from app.models.models import User
+from app.settings import settings
+
+# ? í° URL?€ Swagger UI??(?¤ì œë¡?/api/v1/auth/login)
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl=f"{settings.API_V1_STR}/auth/login")
+
+
+def get_current_user(
+        db: Session = Depends(get_db),
+        token: str = Depends(oauth2_scheme)
+) -> User:
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
+        username: str = payload.get("sub")
+        if username is None:
+            raise credentials_exception
+    except JWTError:
+        raise credentials_exception
+
+    user = db.query(User).filter(User.username == username).first()
+    if user is None:
+        raise credentials_exception
+    return user
+
+
+==============================================================================
+?? FILE: \app\core\security.py
+==============================================================================
+# app/core/security.py
+from datetime import datetime, timedelta
+from typing import Optional
+from passlib.context import CryptContext
+from jose import jwt
+from app.settings import settings
+
+# passlib + bcrypt ?¸í™˜???¤ì •
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    return pwd_context.verify(plain_password, hashed_password)
+
+
+def get_password_hash(password: str) -> str:
+    return pwd_context.hash(password)
+
+
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(minutes=15)
+
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
+    return encoded_jwt
+
+
+==============================================================================
+?? FILE: \app\models\models.py
+==============================================================================
+from sqlalchemy import Column, Integer, String, DateTime, Boolean, ForeignKey, UniqueConstraint, Date, Text
+from sqlalchemy.sql import func
+import uuid
+from app.db import Base
+
+
+class User(Base):
+    __tablename__ = "users"
+    id = Column(Integer, primary_key=True, index=True)
+    username = Column(String, unique=True, index=True)
+    password_hash = Column(String)
+    phone = Column(String)
+    store_name = Column(String)
+    store_uuid = Column(String, unique=True, default=lambda: str(uuid.uuid4()))
+    role = Column(String, default="OWNER")
+    last_heartbeat = Column(DateTime, nullable=True)
+    is_offline_notified = Column(Boolean, default=False)
+    created_at = Column(DateTime, server_default=func.now())
+
+
+class SalesReport(Base):
+    __tablename__ = "sales_reports"
+    report_id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"))
+    report_date = Column(Date)
+    hall = Column(Integer, default=0)
+    baemin = Column(Integer, default=0)
+    coupang = Column(Integer, default=0)
+    yogiyo = Column(Integer, default=0)
+    total_sales = Column(Integer, default=0)
+
+    __table_args__ = (UniqueConstraint('user_id', 'report_date', name='_user_date_uc'),)
+
+
+class SystemLog(Base):
+    __tablename__ = "system_logs"
+    log_id = Column(Integer, primary_key=True, index=True)
+    type = Column(String)  # LOGIN, ERROR, ZOMBIE_SMS µî
+    level = Column(String)  # INFO, WARN, ERROR
+    source = Column(String)  # SERVER, CLIENT
+    message = Column(String)
+    status = Column(String)  # SUCCESS, FAIL
+    meta = Column(String, nullable=True)  # JSON String
+    timestamp = Column(DateTime, server_default=func.now())
+
+
+class ReportNotification(Base):
+    __tablename__ = "report_notifications"
+    notif_id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"))
+    report_date = Column(Date)
+    upload_status = Column(String, default="RECEIVED")
+    primary_channel = Column(String, default="ALIMTALK")
+    primary_status = Column(String, nullable=True)
+    primary_body = Column(String, nullable=True)
+
+    # [¼öÁ¤µÊ] ÀÌ ÇÊµå°¡ ¾ø¾î¼­ ¿¡·¯°¡ ³µ½À´Ï´Ù. ²À Æ÷ÇÔµÇ¾î¾ß ÇÕ´Ï´Ù!
+    error_message = Column(String, nullable=True)
+
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, onupdate=func.now())
+
+    __table_args__ = (UniqueConstraint('user_id', 'report_date', name='_user_date_notif_uc'),)
+
+
+# [½Å±Ô Ãß°¡] ¹öÀü °ü¸®¿ë Å×ÀÌºí
+class Release(Base):
+    __tablename__ = "releases"
+
+    id = Column(Integer, primary_key=True, index=True)
+    version = Column(String, unique=True, index=True)  # ¿¹: "1.0.2"
+    description = Column(Text, nullable=True)  # ¾÷µ¥ÀÌÆ® ³»¿ª
+    download_url = Column(String, nullable=False)  # ¼³Ä¡ÆÄÀÏ °æ·Î
+    is_mandatory = Column(Boolean, default=False)  # °­Á¦ ¾÷µ¥ÀÌÆ® ¿©ºÎ
+    created_at = Column(DateTime, server_default=func.now())
+
+
+==============================================================================
+?? FILE: \app\models\__init__.py
+==============================================================================
+
+
+==============================================================================
+?? FILE: \app\routers\auth.py
+==============================================================================
+from fastapi import APIRouter, Depends
+from sqlalchemy.orm import Session
+from app.db import get_db
+from app.schemas.user_schema import UserCreate, UserResponse, UserLogin, Token
+from app.controllers.auth_controller import AuthController
+from app.models.models import User
+from app.core.deps import get_current_user
+from app.schemas.system import HeartbeatResponse
+
+router = APIRouter()
+
+@router.post("/register", response_model=UserResponse, status_code=201)
+def register(user_in: UserCreate, db: Session = Depends(get_db)):
+    """
+    ?Œì›ê°€??API
+    - store_uuid???œë²„?ì„œ ?ë™ ?ì„±?©ë‹ˆ??
+    - password??bcryptë¡??´ì‹±?˜ì–´ ?€?¥ë©?ˆë‹¤.
+    """
+    return AuthController.register_user(db, user_in)
+
+@router.post("/login", response_model=Token)
+def login(user_in: UserLogin, db: Session = Depends(get_db)):
+    """
+    ë¡œê·¸??API
+    - JWT Access Token??ë°œê¸‰?©ë‹ˆ??
+    """
+    return AuthController.login_user(db, user_in)
+
+@router.post("/heartbeat", response_model=HeartbeatResponse)
+def heartbeat(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Heartbeat API
+    - ?´ë¼?´ì–¸?¸ëŠ” 1ë¶„ë§ˆ????APIë¥??¸ì¶œ?´ì•¼ ??
+    - ?¸ì¶œ ??last_heartbeat ê°±ì‹  ë°?ì¢€ë¹??íƒœ ?´ì œ.
+    """
+    return AuthController.process_heartbeat(db, current_user)
+
+
+==============================================================================
+?? FILE: \app\routers\sales.py
+==============================================================================
+from datetime import date, datetime, timedelta
+import io
+import openpyxl
+from typing import Optional, List
+
+from fastapi import APIRouter, Depends, File, UploadFile, Form, Query, HTTPException
+from fastapi.responses import StreamingResponse
+from sqlalchemy.orm import Session
+
+from app.db import get_db
+from app.models.models import User, SalesReport
+from app.core.deps import get_current_user
+from app.controllers.sales_controller import SalesController
+from app.schemas.sales_schema import SalesReportResponse, MonthlySalesResponse, MonthlySalesSummary
+
+router = APIRouter()
+
+
+@router.post("/upload", response_model=SalesReportResponse)
+async def upload_sales_report(
+        report_date: Optional[date] = Form(None),
+        file: UploadFile = File(...),
+        db: Session = Depends(get_db),
+        current_user: User = Depends(get_current_user)
+):
+    return await SalesController.upload_sales(db, current_user, file, report_date)
+
+
+# [A5 ì¶”ê?] ?”ë³„ ë§¤ì¶œ ì¡°íšŒ
+@router.get("/monthly", response_model=MonthlySalesResponse)
+def get_monthly_sales(
+        month: str = Query(..., description="YYYY-MM format"),
+        db: Session = Depends(get_db),
+        current_user: User = Depends(get_current_user)
+):
+    try:
+        target_date = datetime.strptime(month, "%Y-%m")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid month format. Use YYYY-MM")
+
+    # ?”ì˜ ?œì‘?¼ê³¼ ?ì¼ ê³„ì‚°
+    start_date = date(target_date.year, target_date.month, 1)
+    if target_date.month == 12:
+        end_date = date(target_date.year + 1, 1, 1) - timedelta(days=1)
+    else:
+        end_date = date(target_date.year, target_date.month + 1, 1) - timedelta(days=1)
+
+    reports = db.query(SalesReport).filter(
+        SalesReport.user_id == current_user.id,
+        SalesReport.report_date >= start_date,
+        SalesReport.report_date <= end_date
+    ).order_by(SalesReport.report_date).all()
+
+    daily_logs = []
+    total_accumulated = 0
+
+    for r in reports:
+        total_accumulated += r.total_sales
+        daily_logs.append(MonthlySalesSummary(
+            date=str(r.report_date),
+            total_sales=r.total_sales,
+            platform_sales={
+                "hall": r.hall,
+                "baemin": r.baemin,
+                "coupang": r.coupang,
+                "yogiyo": r.yogiyo
+            }
+        ))
+
+    return MonthlySalesResponse(
+        month=month,
+        total_accumulated=total_accumulated,
+        daily_logs=daily_logs
+    )
+
+
+# [A5 ì¶”ê?] ?‘ì? ?´ë³´?´ê¸° (ê¸°ê°„ ì§€??
+@router.get("/export")
+def export_sales_excel(
+        start: date,
+        end: date,
+        db: Session = Depends(get_db),
+        current_user: User = Depends(get_current_user)
+):
+    # [cite_start]1. ?œë²„ ìµœì¢… ë°©ì–´: ë¯¸ë˜ ? ì§œ ?”ì²­ ì°¨ë‹¨ [cite: 21]
+    if end > date.today():
+        raise HTTPException(status_code=400, detail="Cannot export future data.")
+
+    if start > end:
+        raise HTTPException(status_code=400, detail="Start date cannot be after end date.")
+
+    # 2. ?°ì´??ì¡°íšŒ
+    reports = db.query(SalesReport).filter(
+        SalesReport.user_id == current_user.id,
+        SalesReport.report_date >= start,
+        SalesReport.report_date <= end
+    ).order_by(SalesReport.report_date).all()
+
+    # 3. ?‘ì? ?ì„± (In-memory)
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "ë§¤ì¶œ?´ì—­"
+    ws.append(["? ì§œ", "ì´ë§¤ì¶?, "?€", "ë°°ë‹¬?˜ë?ì¡?, "ì¿ íŒ¡?´ì¸ ", "?”ê¸°??])
+
+    for r in reports:
+        ws.append([str(r.report_date), r.total_sales, r.hall, r.baemin, r.coupang, r.yogiyo])
+
+    output = io.BytesIO()
+    wb.save(output)
+    output.seek(0)
+
+    filename = f"sales_{start}_{end}.xlsx"
+    headers = {'Content-Disposition': f'attachment; filename="{filename}"'}
+
+    return StreamingResponse(
+        output,
+        headers=headers,
+        media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+    )
+
+
+==============================================================================
+?? FILE: \app\routers\system.py
+==============================================================================
+from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy.orm import Session
+from typing import List
+from datetime import date
+
+from app.db import get_db
+from app.models.models import User, ReportNotification, Release
+from app.schemas.system import SystemVersion, ReportHistoryItem, ReportDetailResponse, ReleaseInfo, ReleaseCreate
+from app.core.deps import get_current_user
+from app.settings import settings
+
+# [Áß¿ä] ¶ó¿ìÅÍ »ı¼º
+router = APIRouter()
+
+
+# ---------------------------------------------------------
+# 1. System Info (°æ·Î ¸í½Ã: /system/version)
+# ---------------------------------------------------------
+@router.get("/system/version", response_model=SystemVersion)
+def get_version():
+    return {
+        "version": settings.VERSION,
+        "status": "running",
+        "timezone": settings.TIMEZONE
+    }
+
+
+# ---------------------------------------------------------
+# 2. Reports (°æ·Î: /reports/...)
+# ---------------------------------------------------------
+@router.get("/reports/history", response_model=List[ReportHistoryItem])
+def get_report_history(
+        days: int = 10,
+        db: Session = Depends(get_db),
+        current_user: User = Depends(get_current_user)
+):
+    """ÃÖ±Ù NÀÏ°£ÀÇ ¸®Æ÷Æ® ¾Ë¸² »óÅÂ ¿ä¾à"""
+    history = db.query(ReportNotification).filter(
+        ReportNotification.user_id == current_user.id
+    ).order_by(ReportNotification.report_date.desc()).limit(days).all()
+
+    return [
+        ReportHistoryItem(
+            report_date=h.report_date,
+            upload_status=h.upload_status,
+            primary_status=h.primary_status,
+            sent_at=h.updated_at
+        ) for h in history
+    ]
+
+
+@router.get("/reports/history/{report_date}", response_model=ReportDetailResponse)
+def get_report_detail(
+        report_date: date,
+        db: Session = Depends(get_db),
+        current_user: User = Depends(get_current_user)
+):
+    """Æ¯Á¤ ³¯Â¥ ¾Ë¸² »ó¼¼"""
+    noti = db.query(ReportNotification).filter(
+        ReportNotification.user_id == current_user.id,
+        ReportNotification.report_date == report_date
+    ).first()
+
+    if not noti:
+        raise HTTPException(status_code=404, detail="No report found for this date")
+
+    return ReportDetailResponse(
+        report_date=noti.report_date,
+        upload_status=noti.upload_status,
+        primary_status=noti.primary_status,
+        sent_at=noti.updated_at,
+        primary_body=noti.primary_body,
+        error_message=noti.error_message
+    )
+
+
+# ---------------------------------------------------------
+# 3. Releases (°æ·Î: /releases)
+# ---------------------------------------------------------
+@router.get("/releases", response_model=List[ReleaseInfo])
+def get_releases(db: Session = Depends(get_db)):
+    return db.query(Release).order_by(Release.id.desc()).all()
+
+
+@router.post("/releases", response_model=ReleaseInfo, status_code=201)
+def create_release(
+        release_in: ReleaseCreate,
+        db: Session = Depends(get_db),
+        current_user: User = Depends(get_current_user)
+):
+    if current_user.role != "ADMIN":
+        raise HTTPException(status_code=403, detail="Only admins can publish releases")
+
+    existing = db.query(Release).filter(Release.version == release_in.version).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="Version already exists")
+
+    new_release = Release(
+        version=release_in.version,
+        description=release_in.description,
+        download_url=release_in.download_url,
+        is_mandatory=release_in.is_mandatory
+    )
+    db.add(new_release)
+    db.commit()
+    db.refresh(new_release)
+    return new_release
+
+
+==============================================================================
+?? FILE: \app\routers\users.py
+==============================================================================
+from fastapi import APIRouter, Depends
+from sqlalchemy.orm import Session
+from app.db import get_db
+from app.schemas.user_schema import UserResponse, UserUpdate
+from app.models.models import User
+from app.controllers.user_controller import UserController
+
+# [FIX] ??ì¤„ì´ ?†ì–´???ëŸ¬ê°€ ?¬ìŠµ?ˆë‹¤. ë°˜ë“œ??ì¶”ê??´ì£¼?¸ìš”.
+from app.core.deps import get_current_user
+
+router = APIRouter()
+
+@router.get("/me", response_model=UserResponse)
+def read_users_me(current_user: User = Depends(get_current_user)):
+    """
+    ???•ë³´ ì¡°íšŒ (Authentication ?„ìˆ˜)
+    """
+    return UserController.get_me(current_user)
+
+@router.put("/profile", response_model=UserResponse)
+def update_user_profile(
+    user_in: UserUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    ?„ë¡œ???˜ì • (Authentication ?„ìˆ˜)
+    """
+    return UserController.update_profile(db, current_user, user_in)
+
+
+==============================================================================
+?? FILE: \app\routers\__init__.py
+==============================================================================
+
+
+==============================================================================
+?? FILE: \app\schemas\sales_schema.py
+==============================================================================
+# app/schemas/sales_schema.py
+from pydantic import BaseModel
+from datetime import date
+from typing import List, Dict
+
+class SalesReportResponse(BaseModel):
+    report_id: int
+    report_date: date
+    hall: int
+    baemin: int
+    coupang: int
+    yogiyo: int
+    total_sales: int
+
+    class Config:
+        from_attributes = True
+
+# [A5 ì¶”ê?] ?”ë³„ ì¡°íšŒ??
+class MonthlySalesSummary(BaseModel):
+    date: str       # "2025-01-01"
+    total_sales: int
+    platform_sales: Dict[str, int] # {"baemin": 1000, ...}
+
+class MonthlySalesResponse(BaseModel):
+    month: str      # "2025-01"
+    total_accumulated: int
+    daily_logs: List[MonthlySalesSummary]
+
+
+==============================================================================
+?? FILE: \app\schemas\system.py
+==============================================================================
+from pydantic import BaseModel
+from typing import Optional, List
+from datetime import date, datetime
+
+
+class SystemVersion(BaseModel):
+    version: str
+    status: str
+    timezone: str
+
+
+class HeartbeatResponse(BaseModel):
+    status: str
+    last_heartbeat: str
+
+
+# [A5] ¸®Æ÷Æ® ÀÌ·Â
+class ReportHistoryItem(BaseModel):
+    report_date: date
+    upload_status: str
+    primary_status: str
+    sent_at: Optional[datetime]
+
+
+class ReportDetailResponse(ReportHistoryItem):
+    primary_body: Optional[str]
+    error_message: Optional[str]
+
+
+# [A5] ¸±¸®Áî Á¤º¸
+class ReleaseInfo(BaseModel):
+    version: str
+    description: Optional[str]
+    download_url: str
+    is_mandatory: bool
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class ReleaseCreate(BaseModel):
+    version: str
+    # [¼öÁ¤] = None À» Ãß°¡ÇÏ¿© ÀÔ·ÂÇÏÁö ¾Ê¾Æµµ ¿¡·¯°¡ ³ªÁö ¾Ê°Ô ÇÔ
+    description: Optional[str] = None
+    download_url: str
+    is_mandatory: bool = False
+
+
+==============================================================================
+?? FILE: \app\schemas\user_schema.py
+==============================================================================
+from pydantic import BaseModel
+from datetime import datetime
+from typing import Optional
+
+# [±âÁ¸]
+class UserBase(BaseModel):
+    username: str
+    phone: str
+    store_name: str
+
+class UserCreate(UserBase):
+    password: str
+
+class UserResponse(UserBase):
+    id: int
+    store_uuid: str
+    created_at: datetime
+    class Config:
+        from_attributes = True
+
+# [NEW] ·Î±×ÀÎ ¹× ÅäÅ«
+class UserLogin(BaseModel):
+    username: str
+    password: str
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+
+
+# app/schemas/user_schema.py (±âÁ¸ ³»¿ë ¾Æ·¡¿¡ Ãß°¡)
+
+class UserUpdate(BaseModel):
+    phone: Optional[str] = None
+    store_name: Optional[str] = None
+
+    # ±× ¿Ü ÇÊµå(username, role µî)°¡ µé¾î¿À¸é ¿¡·¯¸¦ ¹ñ°Å³ª ¹«½ÃÇÏµµ·Ï ¼³Á¤
+    # ¸í¼¼ÀÇ "º¯°æ °ÅºÎ"¸¦ È®½ÇÈ÷ ÇÏ±â À§ÇØ, Pydantic ·¹º§¿¡¼­ ÇÊÅÍ¸µÇÕ´Ï´Ù.
+    class Config:
+        extra = "forbid"  # Á¤ÀÇµÇÁö ¾ÊÀº ÇÊµå°¡ ¿À¸é 422 Unprocessable Entity ¹ß»ı (»ç½Ç»ó °ÅºÎ)
+
+
+==============================================================================
+?? FILE: \app\schemas\__init__.py
+==============================================================================
+
+
+==============================================================================
+?? FILE: \app\services\monitoring.py
+==============================================================================
+# app/services/monitoring.py
+from datetime import datetime, timedelta
+from sqlalchemy.orm import Session
+from app.models.models import User, SystemLog
+from app.db import SessionLocal
+from app.settings import settings
+from app.services.notification import NotificationService  # [ì¶”ê?] ?¤ì œ ë°œì†¡???„í•´ ?„í¬??
+
+
+class MonitoringService:
+    @staticmethod
+    def log_event(db: Session, type: str, level: str, message: str, meta: str = None):
+        """?œìŠ¤??ë¡œê·¸ ?ì¬ ?¬í¼"""
+        try:
+            log = SystemLog(
+                type=type,
+                level=level,
+                source="SERVER",
+                message=message,
+                status="SUCCESS",
+                meta=meta
+            )
+            db.add(log)
+            # ?¬ê¸°??commit ?˜ì? ?ŠìŒ (?¸ì¶œ?ê? ?¼ê´„ commit ?˜ë„ë¡?
+        except Exception as e:
+            print(f"[Log Error] {e}")
+
+    @staticmethod
+    def send_zombie_alert(db: Session, user: User):
+        """
+        ?¤ì œ Solapi SMS ë°œì†¡ ë¡œì§ ?°ë™
+        """
+        # NotificationService??êµ¬í˜„??'?ˆì „???¨í„´'??SMS ë°œì†¡ ë¡œì§???¸ì¶œ?©ë‹ˆ??
+        # ?±ê³µ ??True, ?¤íŒ¨ ??False ë°˜í™˜
+        return NotificationService.send_zombie_alert(db, user)
+
+    @staticmethod
+    def check_zombies():
+        """
+        ì£¼ê¸°?ìœ¼ë¡??¤í–‰?˜ì–´ 5ë¶??´ìƒ ?˜íŠ¸ë¹„íŠ¸ê°€ ?†ëŠ” ? ì?ë¥?ê°ì??©ë‹ˆ??
+        """
+        db = SessionLocal()
+        try:
+            # ê¸°ì?: ?„ì¬?œê°„ - 5ë¶?
+            threshold = datetime.now() - timedelta(minutes=60)
+
+            # ?”ë²„ê¹? ?œë²„ ?œê°„ ?•ì¸
+            # print(f"[Monitoring] Checking at {datetime.now()} (Threshold: {threshold})")
+
+            # ì¡°ê±´: ?˜íŠ¸ë¹„íŠ¸ê°€ 5ë¶??„ì´ê³?+ ?„ì§ ?Œë¦¼????ë³´ë‚¸(is_offline_notified=False) ? ì?
+            zombies = db.query(User).filter(
+                User.last_heartbeat < threshold,
+                User.is_offline_notified == False
+            ).all()
+
+            if zombies:
+                print(f"[Monitoring] Detected {len(zombies)} zombies.")
+
+            for user in zombies:
+                # 1. SMS ë°œì†¡ ?œë„ (NotificationService ?„ì„)
+                # db ?¸ì…˜??ê°™ì´ ?˜ê²¨???œìŠ¤??ë¡œê·¸ë¥??¨ê¸¸ ???ˆê²Œ ??
+                sent = MonitoringService.send_zombie_alert(db, user)
+
+                if sent:
+                    # 2. ?±ê³µ ???íƒœ ?…ë°?´íŠ¸ (ì¤‘ë³µ ë°œì†¡ ë°©ì?)
+                    user.is_offline_notified = True
+                    db.add(user)
+
+                    # 3. ì¶”ê? ë¡œê·¸ ?ì¬ (A3 ?”êµ¬?¬í•­)
+                    MonitoringService.log_event(
+                        db,
+                        type="ZOMBIE_SMS",
+                        level="WARN",
+                        message=f"Zombie detected & Sent: {user.username} ({user.store_name})",
+                        meta=f'{{"user_id": {user.id}}}'
+                    )
+                else:
+                    # ?¤íŒ¨ ??ë¡œê·¸ë§??¨ê¸°ê³? is_offline_notified??False ? ì? (?¤ìŒ ì£¼ê¸°???¬ì‹œ??
+                    print(f"[Monitoring] Failed to send SMS to {user.store_name}")
+
+            # ë³€ê²½ì‚¬???¼ê´„ ?€??
+            db.commit()
+
+        except Exception as e:
+            print(f"[Monitoring Error] {e}")
+            db.rollback()
+        finally:
+            db.close()
+
+    @staticmethod
+    def daily_reset():
+        """
+        [ëª…ì„¸] ?˜ë£¨ 1??Zombie SMS + 00:05 ë¦¬ì…‹
+        00:05???¤í–‰?˜ì–´ ?Œë¦¼ ?íƒœë¥?ì´ˆê¸°?”í•©?ˆë‹¤.
+        """
+        print("[Scheduler] Daily Reset Logic Executed at 00:05")
+
+        db = SessionLocal()
+        try:
+            # ëª¨ë“  ? ì????Œë¦¼ ?íƒœë¥?ì´ˆê¸°??(?´ì¼ ?¤ì‹œ ?Œë¦¼ ë°›ì„ ???ˆê²Œ)
+            db.query(User).update({User.is_offline_notified: False})
+            db.commit()
+            print("[Scheduler] All users' offline status reset to False.")
+        except Exception as e:
+            print(f"[Reset Error] {e}")
+            db.rollback()
+        finally:
+            db.close()
+
+
+==============================================================================
+?? FILE: \app\services\notification.py
+==============================================================================
+import requests
+import json
+import datetime
+import hmac
+import hashlib
+import uuid
+from sqlalchemy.orm import Session
+from app.models.models import ReportNotification, User, SalesReport, SystemLog
+from app.settings import settings
+
+
+class NotificationService:
+    # ------------------------------------------------------------------
+    # [1] ?Œë¦¼??ê´€??ë¡œì§ (?¼ì¼ ë§¤ì¶œ ë³´ê³  -> ê´€ë¦¬ì?ê²Œ ?„ì†¡)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _get_solapi_header():
+        """?Œë¦¼?¡ìš© ?¤ë” ?ì„±ê¸?""
+        date_str = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        salt = str(uuid.uuid4())
+        data = date_str + salt
+        signature = hmac.new(
+            key=settings.SOLAPI_SECRET.encode("utf-8"),
+            msg=data.encode("utf-8"),
+            digestmod=hashlib.sha256
+        ).hexdigest()
+        return {
+            "Authorization": f"HMAC-SHA256 apiKey={settings.SOLAPI_KEY}, date={date_str}, salt={salt}, signature={signature}",
+            "Content-Type": "application/json"
+        }
+
+    @staticmethod
+    def send_daily_report(db: Session, user: User, report: SalesReport):
+        """
+        [?¼ì¼ ë§¤ì¶œ ë³´ê³ ] -> ?Œë¦¼??
+        ?˜ì‹ ?? settings.MANAGER_PHONE (ê´€ë¦¬ì)
+        """
+        body = (
+            f"[{user.store_name}] {report.report_date} ?¼ì¼ë§¤ì¶œ\n"
+            f"ì´?: {report.total_sales:,}\n\n"
+            f"?€ : {report.hall:,}\n"
+            f"ë°°ë? : {report.baemin:,}\n"
+            f"ì¿ íŒ¡ : {report.coupang:,}\n"
+            f"?”ê¸°??: {report.yogiyo:,}\n"
+            f"?…ë‹ˆ??"
+        )
+
+        # ?´ë? ë³´ë‚¸ ?´ë ¥???ˆëŠ”ì§€ ?•ì¸
+        notif = db.query(ReportNotification).filter(
+            ReportNotification.user_id == user.id,
+            ReportNotification.report_date == report.report_date
+        ).first()
+
+        if not notif:
+            notif = ReportNotification(
+                user_id=user.id,
+                report_date=report.report_date,
+                upload_status="RECEIVED",
+                primary_channel="ALIMTALK"
+            )
+            db.add(notif)
+
+        try:
+            # ?Œë¦¼??ë°œì†¡ ë¡œì§
+            url = "https://api.solapi.com/messages/v4/send"
+            headers = NotificationService._get_solapi_header()
+            data = {
+                "message": {
+                    "to": settings.MANAGER_PHONE,  # [? ì?] ë§¤ì¶œ ë¦¬í¬?¸ëŠ” ê´€ë¦¬ì?ê²Œ
+                    "from": settings.SENDER_PHONE,
+                    "text": body,
+                    "kakaoOptions": {
+                        "pfId": settings.KAKAO_PF_ID,
+                        "templateId": settings.KAKAO_TEMPLATE_ID,
+                        "disableSms": True
+                    }
+                }
+            }
+            resp = requests.post(url, headers=headers, json=data).json()
+
+            notif.primary_status = "SENT"
+            notif.primary_body = body
+            notif.provider_message_id = resp.get("messageId")
+            notif.updated_at = datetime.datetime.now()
+
+            # ?œìŠ¤??ë¡œê·¸ ê¸°ë¡
+            db.add(SystemLog(type="ALIMTALK", level="INFO", source="SERVER", message="Daily report sent",
+                             status="SUCCESS"))
+            print(f"[ALIMTALK SUCCESS] MessageId: {resp.get('messageId')}")
+
+        except Exception as e:
+            error_msg = str(e)
+            notif.primary_status = "FAIL"
+            notif.error_message = error_msg
+            notif.updated_at = datetime.datetime.now()
+
+            db.add(
+                SystemLog(type="ALIMTALK", level="ERROR", source="SERVER", message=f"Fail: {error_msg}", status="FAIL"))
+            print(f"[ALIMTALK FAIL] {error_msg}")
+
+        db.commit()
+
+    # ------------------------------------------------------------------
+    # [2] ì¢€ë¹??Œë¦¼ ë¡œì§ (PC êº¼ì§ ê°ì? -> ?¬ì¥?˜ì—ê²??„ì†¡)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def send_zombie_alert(db: Session, user: User):
+        """
+        [ì¢€ë¹??€ì³??Œë¦¼]
+        ?˜ì‹ ?? user.phone (?´ë‹¹ ë§¤ì¥ ?¬ì¥??
+        """
+        print(f"\n=== ?§Ÿ ì¢€ë¹??Œë¦¼ ë°œì†¡ ?œì‘ (To Owner) ===")
+
+        # [?ˆì „?¥ì¹˜] ?¬ì¥???„í™”ë²ˆí˜¸ê°€ ?†ëŠ” ê²½ìš° ì²˜ë¦¬
+        if not user.phone:
+            error_msg = f"User {user.username} ({user.store_name}) has no phone number."
+            print(f"[ZOMBIE FAIL] {error_msg}")
+            db.add(SystemLog(type="ZOMBIE_SMS", level="ERROR", source="SERVER", message=error_msg, status="FAIL"))
+            db.commit()
+            return False
+
+        # [ë©”ì‹œì§€ ?´ìš©]
+        text_body = f"[{user.store_name}] ë² ì??˜ì´ê°€ ì¢…ë£Œ?˜ì—ˆ?µë‹ˆ?? ?¤ì‹œ ì¼œì£¼?¸ìš”."
+
+        try:
+            # (1) ?¤ë” ?ì„±
+            date_str = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            salt = str(uuid.uuid4())
+            data = date_str + salt
+            signature = hmac.new(
+                key=settings.SOLAPI_SECRET.encode("utf-8"),
+                msg=data.encode("utf-8"),
+                digestmod=hashlib.sha256
+            ).hexdigest()
+
+            headers = {
+                "Authorization": f"HMAC-SHA256 apiKey={settings.SOLAPI_KEY}, date={date_str}, salt={salt}, signature={signature}",
+                "Content-Type": "application/json"
+            }
+
+            # (2) ?˜ì´ë¡œë“œ êµ¬ì„±
+            body = {
+                "message": {
+                    "to": user.phone,  # [?˜ì •?? ?¬ì¥??ë³¸ì¸ ?´ë???ë²ˆí˜¸
+                    "from": settings.SENDER_PHONE,  # ë°œì‹ ?ëŠ” ?¤ì •??ë²ˆí˜¸ (?€?œë²ˆ????
+                    "text": text_body,
+                    "type": "SMS"
+                }
+            }
+
+            # [?”ë²„ê¹?
+            print(f"   - From: {settings.SENDER_PHONE}")
+            print(f"   - To: {user.phone} (?¬ì¥??")
+            print(f"   - Text: {text_body}")
+
+            # (3) ë°œì†¡
+            url = "https://api.solapi.com/messages/v4/send"
+            res = requests.post(url, headers=headers, json=body)
+
+            if res.status_code != 200:
+                raise Exception(f"Solapi API Error: {res.text}")
+
+            resp = res.json()
+
+            # ë¡œê·¸ ê¸°ë¡
+            db.add(SystemLog(
+                type="ZOMBIE_SMS",
+                level="WARN",
+                source="SERVER",
+                message=f"Zombie Alert sent to {user.store_name}",
+                status="SUCCESS",
+                meta=f'{{"user_id": {user.id}, "phone": "{user.phone}"}}'
+            ))
+            db.commit()
+            print(f"[ZOMBIE SMS SUCCESS] MessageId: {resp.get('messageId')}")
+            return True
+
+        except Exception as e:
+            print(f"[ZOMBIE SMS FAIL] {str(e)}")
+            db.add(SystemLog(type="ZOMBIE_SMS", level="ERROR", source="SERVER", message=str(e), status="FAIL"))
+            db.commit()
+            return False
+
+
+==============================================================================
+?? FILE: \app\services\parser.py
+==============================================================================
+import io
+import msoffcrypto
+import pandas as pd
+import openpyxl
+from datetime import date, datetime  # [ì¶”ê?] ? ì§œ ë¹„êµ??
+from fastapi import UploadFile, HTTPException
+from app.settings import settings
+
+
+class ExcelParser:
+    @staticmethod
+    async def parse_sales_file(file: UploadFile):
+        # 1. ?Œì¼ ì¤€ë¹?
+        file_content = await file.read()
+        file_io = io.BytesIO(file_content)
+        decrypted = io.BytesIO()
+        try:
+            office_file = msoffcrypto.OfficeFile(file_io)
+            office_file.load_key(password=settings.EXCEL_PASSWORD)
+            office_file.decrypt(decrypted)
+            decrypted.seek(0)
+        except Exception:
+            file_io.seek(0)
+            decrypted = file_io
+
+        # 2. ?‘ì? ?½ê¸°
+        try:
+            df = pd.read_excel(decrypted, sheet_name=settings.EXCEL_SHEET_NAME, header=None)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Excel parsing error: {str(e)}")
+
+        # 3. ?¤ë” ì°¾ê¸° (?¤ì›Œ??ê¸°ë°˜)
+        header_row_idx = -1
+        keywords = ["ì¹´ë“œ", "?„ê¸ˆ", "ë°°ë?", "ë°°ë‹¬", "ì¿ íŒ¡", "?”ê¸°??, "?´ì²´", "KBêµ??ì¹´ë“œ", "? í•œì¹´ë“œ", "ë¹„ì”¨ì¹´ë“œ"]
+
+        for r_idx, row in df.iterrows():
+            row_str = " ".join([str(val) for val in row if pd.notna(val)])
+            if any(k in row_str for k in keywords):
+                header_row_idx = r_idx
+                break
+
+        if header_row_idx == -1:
+            for r_idx, row in df.iterrows():
+                if "ë§¤ì…?¬ë³„" in " ".join([str(val) for val in row if pd.notna(val)]):
+                    if r_idx + 1 < len(df):
+                        header_row_idx = r_idx + 1
+                        break
+            if header_row_idx == -1:
+                raise HTTPException(status_code=400, detail="Cannot find header row.")
+
+        # 4. ?°ì´????ì¶”ì¶œ
+        if header_row_idx + 1 >= len(df):
+            return {"hall": 0, "baemin": 0, "coupang": 0, "yogiyo": 0}
+
+        header_row = df.iloc[header_row_idx]
+
+        # [NEW] ?°ì´??? ì§œ ê²€ì¦?ë¡œì§ ?œì‘ =================================
+        # ?¤ë” ë°”ë¡œ ?„ë«ì¤„ì´ ?°ì´?°ë¼ê³?ê°€?•í•˜ê³? ì²?ë²ˆì§¸ ì»¬ëŸ¼(0ë²???? ì§œë¡??•ì¸
+        data_row = df.iloc[header_row_idx + 1]
+
+        try:
+            raw_date = data_row[0]  # ì²?ë²ˆì§¸ ì¹?ê°€?¸ì˜¤ê¸?
+            excel_date = None
+
+            # 1) ?´ë? ? ì§œ ?•ì‹?´ë©´ ê·¸ë?ë¡??¬ìš©
+            if isinstance(raw_date, (pd.Timestamp, datetime, date)):
+                excel_date = raw_date.date() if isinstance(raw_date, (pd.Timestamp, datetime)) else raw_date
+
+            # 2) ë¬¸ì?´ì´ë©??Œì‹± ?œë„ ("2026-01-12" or "2026.01.12")
+            elif isinstance(raw_date, str):
+                clean_date_str = raw_date.strip().replace('.', '-')
+                excel_date = datetime.strptime(clean_date_str, "%Y-%m-%d").date()
+
+            # 3) ê²€ì¦? ?‘ì? ? ì§œ vs ?¤ëŠ˜ ? ì§œ
+            if excel_date:
+                server_today = date.today()
+                if excel_date != server_today:
+                    print(f"??? ì§œ ë¶ˆì¼ì¹?ì°¨ë‹¨! ?‘ì?: {excel_date}, ?œë²„: {server_today}")
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Report date mismatch. File date: {excel_date}, Today: {server_today}"
+                    )
+                else:
+                    print(f"??? ì§œ ê²€ì¦??µê³¼: {excel_date}")
+
+        except HTTPException as he:
+            raise he  # ë¶ˆì¼ì¹??ëŸ¬??ê·¸ë?ë¡??˜ì§
+        except Exception as e:
+            # ? ì§œ ?Œì‹± ?¤íŒ¨ ?? ?¼ë‹¨ ê²½ê³ ë§??˜ê³  ?˜ì–´ê°€ê±°ë‚˜, ?•ì±…???°ë¼ ë§‰ì„ ?˜ë„ ?ˆìŒ
+            # ?¬ê¸°?œëŠ” ?ˆì „?˜ê²Œ ë¡œê·¸ë§?ì°ê³  ?˜ì–´ê°‘ë‹ˆ?? (?‘ì‹???¤ë? ???ˆìœ¼ë¯€ë¡?
+            print(f"? ï¸ ? ì§œ ?Œì‹± ?¤íŒ¨ (ê²€ì¦?ê±´ë„ˆ?€): {e}")
+        # =================================================================
+
+        # 5. ?°ì´???Œì‹± ë°??©ì‚°
+        result = {"hall": 0, "baemin": 0, "coupang": 0, "yogiyo": 0}
+
+        for i in range(header_row_idx + 1, len(df)):
+            data_row = df.iloc[i]
+            row_str = " ".join([str(v) for v in data_row if pd.notna(v)])
+            if not row_str or "?©ê³„" in row_str or "?Œê³„" in row_str: continue
+
+            for col_idx in range(len(header_row)):
+                col_name = str(header_row[col_idx]).strip()
+                raw_val = data_row[col_idx]
+
+                if pd.isna(col_name) or pd.isna(raw_val) or col_name == 'nan': continue
+
+                # ì¤‘ë³µ ì»¬ëŸ¼ ë¸”ë™ë¦¬ìŠ¤??
+                if col_name in ["ì¹´ë“œ", "QRê²°ì œ", "? ìš©ì¹´ë“œ", "ê²°ì œ?©ê³„"]: continue
+                if "ê¸ˆì•¡" in col_name or "ê±´ìˆ˜" in col_name or "ì´ê³„" in col_name: continue
+
+                # ê¸ˆì•¡ ë³€??
+                amount = 0
+                try:
+                    if isinstance(raw_val, (int, float)):
+                        amount = int(raw_val)
+                    else:
+                        clean_str = str(raw_val).replace(",", "").replace("??, "").strip()
+                        if clean_str.lstrip('-').isdigit():
+                            amount = int(clean_str)
+                except:
+                    continue
+
+                if amount == 0: continue
+
+                # ë¶„ë¥˜ ë¡œì§
+                if "ë°°ë‹¬?˜ë?ì¡? in col_name or "ë°°ë?" in col_name:
+                    result["baemin"] += amount
+                elif "ì¿ íŒ¡" in col_name or "coupang" in col_name:
+                    result["coupang"] += amount
+                elif "?”ê¸°?? in col_name or "yogiyo" in col_name:
+                    result["yogiyo"] += amount
+                else:
+                    result["hall"] += amount
+
+        return result
+
+
+==============================================================================
+?? FILE: \app\services\__init__.py
+==============================================================================

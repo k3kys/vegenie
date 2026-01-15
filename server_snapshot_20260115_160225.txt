@@ -1,0 +1,3120 @@
+================================================================================
+FILE PATH: app\controllers\auth_controller.py
+================================================================================
+import random
+import string
+from sqlalchemy.orm import Session
+from fastapi import HTTPException, status
+from datetime import timedelta, datetime
+
+from app.models.models import User
+from app.schemas.user_schema import UserCreate, UserLogin, FindIdRequest, ResetPasswordRequest
+from app.core.security import get_password_hash, verify_password, create_access_token
+from app.settings import settings
+from app.services.notification import NotificationService
+
+
+class AuthController:
+    @staticmethod
+    def register_user(db: Session, user_in: UserCreate):
+        # 1. Username 중복 체크
+        existing_user = db.query(User).filter(User.username == user_in.username).first()
+        if existing_user:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Username already exists"
+            )
+
+        # 2. 비밀번호 해싱 및 User 객체 생성
+        db_user = User(
+            username=user_in.username,
+            password_hash=get_password_hash(user_in.password),
+            phone=user_in.phone,
+            store_name=user_in.store_name,
+            role="OWNER"
+        )
+
+        db.add(db_user)
+        db.commit()
+        db.refresh(db_user)
+        return db_user
+
+    @staticmethod
+    def login_user(db: Session, user_in: UserLogin):
+        # 1. 유저 조회
+        user = db.query(User).filter(User.username == user_in.username).first()
+        if not user:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Incorrect username or password",
+            )
+
+        # 2. 비밀번호 검증
+        if not verify_password(user_in.password, user.password_hash):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Incorrect username or password",
+            )
+
+        # 3. 토큰 발급
+        access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+        access_token = create_access_token(
+            data={"sub": user.username, "user_id": user.id},
+            expires_delta=access_token_expires
+        )
+
+        return {
+            "access_token": access_token,
+            "token_type": "bearer"
+        }
+
+    @staticmethod
+    def process_heartbeat(db: Session, current_user: User):
+        # 1. 마지막 수신 시간 갱신
+        current_user.last_heartbeat = datetime.now()
+
+        # 2. [로직 수정] 앱이 켜져서 신호를 보냈으므로 감시 상태를 True(정상/감시중)로 유지
+        # 이렇게 해두어야 monitoring에서 '오늘 신호가 있었고 상태가 True인 매장'을 감시합니다.
+        current_user.is_offline_notified = True
+
+        db.add(current_user)
+        db.commit()
+        db.refresh(current_user)
+
+        return {
+            "status": "alive",
+            "last_heartbeat": str(current_user.last_heartbeat)
+        }
+
+    # ------------------------------------------------------------------
+    # [NEW] 아이디 찾기 (휴대폰 번호 기준)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def find_username(db: Session, user_in: FindIdRequest):
+        user = db.query(User).filter(User.phone == user_in.phone).first()
+        if not user:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="해당 번호로 등록된 아이디가 없습니다."
+            )
+
+        # 보안을 위해 아이디의 일부를 마스킹 처리
+        masked_username = user.username[:3] + "*" * (len(user.username) - 3)
+        return {"username": masked_username}
+
+    # ------------------------------------------------------------------
+    # [NEW] 비밀번호 재설정 (임시 비밀번호 생성 및 SMS 발송)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def reset_password(db: Session, user_in: ResetPasswordRequest):
+        user = db.query(User).filter(
+            User.username == user_in.username,
+            User.phone == user_in.phone
+        ).first()
+
+        if not user:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="일치하는 사용자 정보가 없습니다."
+            )
+
+        # 1. 8자리 영문+숫자 혼합 임시 비밀번호 생성
+        temp_password = ''.join(random.choices(string.ascii_letters + string.digits, k=8))
+
+        # 2. 비밀번호 해싱 및 DB 업데이트
+        user.password_hash = get_password_hash(temp_password)
+        db.add(user)
+        db.commit()
+
+        # 3. SMS 발송
+        sms_text = f"[{user.store_name}] 임시 비밀번호는 [{temp_password}] 입니다. 로그인 후 반드시 변경해주세요."
+        sent = NotificationService.send_generic_sms(user.phone, sms_text)
+
+        if not sent:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="임시 비밀번호 발송에 실패했습니다. 관리자에게 문의하세요."
+            )
+
+        return {"message": "임시 비밀번호가 휴대폰으로 발송되었습니다."}
+
+
+================================================================================
+FILE PATH: app\controllers\sales_controller.py
+================================================================================
+# app/controllers/sales_controller.py
+from datetime import date
+from sqlalchemy.orm import Session
+from fastapi import UploadFile, HTTPException
+from app.models.models import User, SalesReport, SystemLog
+from app.services.parser import ExcelParser
+from app.services.notification import NotificationService
+
+class SalesController:
+    @staticmethod
+    async def upload_sales(db: Session, current_user: User, file: UploadFile, report_date: date = None):
+        # -------------------------------------------------------
+        # [cite_start]Step 1) report_date 확정/검증 (서버 권위) [cite: 21]
+        # -------------------------------------------------------
+        server_today = date.today()
+
+        if report_date is None:
+            # 미제공 시 서버 today로 확정
+            final_date = server_today
+        else:
+            # 제공 시 검증: 불일치 400
+            if report_date != server_today:
+                raise HTTPException(status_code=400, detail="Report date must match server today.")
+            final_date = report_date
+
+        # -------------------------------------------------------
+        # Step 2~5) 엑셀 파싱 (기존 로직 동일)
+        # -------------------------------------------------------
+        try:
+            parsed = await ExcelParser.parse_sales_file(file)
+        except HTTPException as he:
+            raise he  # 400 에러는 그대로 전달
+        except Exception as e:
+            db.add(SystemLog(type="UPLOAD", level="ERROR", source="SERVER", message=f"Parse Error: {str(e)}",
+                             status="FAIL"))
+            db.commit()
+            raise HTTPException(status_code=400, detail="Excel parsing failed")
+
+        # -------------------------------------------------------
+        # [cite_start]Step 7) Total 재계산 (SSOT) [cite: 9]
+        # -------------------------------------------------------
+        total = parsed["hall"] + parsed["baemin"] + parsed["coupang"] + parsed["yogiyo"]
+
+        # -------------------------------------------------------
+        # [cite_start]Step 6) sales_reports upsert [cite: 21]
+        # -------------------------------------------------------
+        report = db.query(SalesReport).filter(
+            SalesReport.user_id == current_user.id,
+            SalesReport.report_date == final_date
+        ).first()
+
+        if not report:
+            report = SalesReport(user_id=current_user.id, report_date=final_date)
+
+        report.hall = parsed["hall"]
+        report.baemin = parsed["baemin"]
+        report.coupang = parsed["coupang"]
+        report.yogiyo = parsed["yogiyo"]
+        report.total_sales = total
+
+        db.add(report)
+        db.commit()
+        db.refresh(report)  # ID 획득
+
+        # -------------------------------------------------------
+        # [cite_start]Step 8) report_notifications + 알림톡 발송 [cite: 16]
+        # 정책: 알림 실패해도 업로드는 200 유지 (Try-Except 내부 처리)
+        # -------------------------------------------------------
+        NotificationService.send_daily_report(db, current_user, report)
+
+        # -------------------------------------------------------
+        # [cite_start]Step 9) System Log [cite: 21]
+        # -------------------------------------------------------
+        db.add(SystemLog(
+            type="UPLOAD",
+            level="INFO",
+            source="SERVER",
+            message="Upload & Parsing Success",
+            status="SUCCESS",
+            meta=f'{{"report_id": {report.report_id}, "total": {total}}}'
+        ))
+        db.commit()
+
+        return report
+
+    @staticmethod
+    def _log(db, level, msg, user):
+        # 시스템 로그 적재 헬퍼 (모델에 SystemLog가 있어야 함)
+        try:
+            log = SystemLog(
+                type="UPLOAD",
+                level=level,
+                source="SERVER",
+                message=msg,
+                status="SUCCESS" if level == "INFO" else "FAIL",
+                meta=f'{{"user_id": {user.id}}}'
+            )
+            db.add(log)
+            # 여기서 commit은 메인 트랜잭션과 함께 처리되도록 함
+        except:
+            pass  # 로그 실패가 로직을 막지 않게
+
+
+================================================================================
+FILE PATH: app\controllers\user_controller.py
+================================================================================
+# app/controllers/user_controller.py
+from sqlalchemy.orm import Session
+from fastapi import HTTPException, status
+from app.models.models import User
+from app.schemas.user_schema import UserUpdate
+
+
+class UserController:
+    @staticmethod
+    def get_me(current_user: User):
+        # 현재 로그인한 사용자 객체 반환
+        return current_user
+
+    @staticmethod
+    def update_profile(db: Session, current_user: User, user_in: UserUpdate):
+        # 명세: phone/store_name만 변경 허용 (화이트리스트)
+        # 스키마(UserUpdate)에서 이미 필터링되지만, 로직에서도 명시적으로 처리
+
+        updates_made = False
+
+        if user_in.phone is not None:
+            current_user.phone = user_in.phone
+            updates_made = True
+
+        if user_in.store_name is not None:
+            current_user.store_name = user_in.store_name
+            updates_made = True
+
+        if updates_made:
+            db.add(current_user)
+            db.commit()
+            db.refresh(current_user)
+
+        return current_user
+
+
+================================================================================
+FILE PATH: app\controllers\__init__.py
+================================================================================
+
+
+================================================================================
+FILE PATH: app\core\deps.py
+================================================================================
+# app/core/deps.py
+from typing import Generator, Optional
+from fastapi import Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordBearer
+from jose import jwt, JWTError
+from sqlalchemy.orm import Session
+from app.db import get_db
+from app.models.models import User
+from app.settings import settings
+
+# 토큰 URL은 Swagger UI용 (실제론 /api/v1/auth/login)
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl=f"{settings.API_V1_STR}/auth/login")
+
+
+def get_current_user(
+        db: Session = Depends(get_db),
+        token: str = Depends(oauth2_scheme)
+) -> User:
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
+        username: str = payload.get("sub")
+        if username is None:
+            raise credentials_exception
+    except JWTError:
+        raise credentials_exception
+
+    user = db.query(User).filter(User.username == username).first()
+    if user is None:
+        raise credentials_exception
+    return user
+
+
+================================================================================
+FILE PATH: app\core\security.py
+================================================================================
+# app/core/security.py
+from datetime import datetime, timedelta
+from typing import Optional
+from passlib.context import CryptContext
+from jose import jwt
+from app.settings import settings
+
+# passlib + bcrypt 호환성 설정
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    return pwd_context.verify(plain_password, hashed_password)
+
+
+def get_password_hash(password: str) -> str:
+    return pwd_context.hash(password)
+
+
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(minutes=15)
+
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
+    return encoded_jwt
+
+
+================================================================================
+FILE PATH: app\models\models.py
+================================================================================
+from sqlalchemy import Column, Integer, String, DateTime, Boolean, ForeignKey, UniqueConstraint, Date, Text
+from sqlalchemy.sql import func
+import uuid
+from app.db import Base
+
+
+class User(Base):
+    __tablename__ = "users"
+    id = Column(Integer, primary_key=True, index=True)
+    username = Column(String, unique=True, index=True)
+    password_hash = Column(String)
+    phone = Column(String)
+    store_name = Column(String)
+    store_uuid = Column(String, unique=True, default=lambda: str(uuid.uuid4()))
+    role = Column(String, default="OWNER")
+    last_heartbeat = Column(DateTime, nullable=True)
+    is_offline_notified = Column(Boolean, default=False)
+    created_at = Column(DateTime, server_default=func.now())
+
+
+class SalesReport(Base):
+    __tablename__ = "sales_reports"
+    report_id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"))
+    report_date = Column(Date)
+    hall = Column(Integer, default=0)
+    baemin = Column(Integer, default=0)
+    coupang = Column(Integer, default=0)
+    yogiyo = Column(Integer, default=0)
+    total_sales = Column(Integer, default=0)
+
+    __table_args__ = (UniqueConstraint('user_id', 'report_date', name='_user_date_uc'),)
+
+
+class SystemLog(Base):
+    __tablename__ = "system_logs"
+    log_id = Column(Integer, primary_key=True, index=True)
+    type = Column(String)  # LOGIN, ERROR, ZOMBIE_SMS 등
+    level = Column(String)  # INFO, WARN, ERROR
+    source = Column(String)  # SERVER, CLIENT
+    message = Column(String)
+    status = Column(String)  # SUCCESS, FAIL
+    meta = Column(String, nullable=True)  # JSON String
+    timestamp = Column(DateTime, server_default=func.now())
+
+
+class ReportNotification(Base):
+    __tablename__ = "report_notifications"
+    notif_id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"))
+    report_date = Column(Date)
+    upload_status = Column(String, default="RECEIVED")
+    primary_channel = Column(String, default="ALIMTALK")
+    primary_status = Column(String, nullable=True)
+    primary_body = Column(String, nullable=True)
+
+    # [수정됨] 이 필드가 없어서 에러가 났습니다. 꼭 포함되어야 합니다!
+    error_message = Column(String, nullable=True)
+
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, onupdate=func.now())
+
+    __table_args__ = (UniqueConstraint('user_id', 'report_date', name='_user_date_notif_uc'),)
+
+
+# [신규 추가] 버전 관리용 테이블
+class Release(Base):
+    __tablename__ = "releases"
+
+    id = Column(Integer, primary_key=True, index=True)
+    version = Column(String, unique=True, index=True)  # 예: "1.0.2"
+    description = Column(Text, nullable=True)  # 업데이트 내역
+    download_url = Column(String, nullable=False)  # 설치파일 경로
+    is_mandatory = Column(Boolean, default=False)  # 강제 업데이트 여부
+    created_at = Column(DateTime, server_default=func.now())
+
+
+================================================================================
+FILE PATH: app\models\__init__.py
+================================================================================
+
+
+================================================================================
+FILE PATH: app\routers\auth.py
+================================================================================
+from fastapi import APIRouter, Depends
+from sqlalchemy.orm import Session
+from app.db import get_db
+from app.schemas.user_schema import (
+    UserCreate,
+    UserResponse,
+    UserLogin,
+    Token,
+    FindIdRequest,
+    ResetPasswordRequest
+)
+from app.controllers.auth_controller import AuthController
+from app.models.models import User
+from app.core.deps import get_current_user
+from app.schemas.system import HeartbeatResponse
+
+router = APIRouter()
+
+@router.post("/register", response_model=UserResponse, status_code=201)
+def register(user_in: UserCreate, db: Session = Depends(get_db)):
+    """
+    회원가입 API [cite: 304]
+    - store_uuid는 서버에서 자동 생성됩니다. [cite: 304]
+    - password는 bcrypt로 해싱되어 저장됩니다. [cite: 304]
+    """
+    return AuthController.register_user(db, user_in)
+
+@router.post("/login", response_model=Token)
+def login(user_in: UserLogin, db: Session = Depends(get_db)):
+    """
+    로그인 API [cite: 304]
+    - JWT Access Token을 발급합니다. [cite: 304]
+    """
+    return AuthController.login_user(db, user_in)
+
+@router.post("/heartbeat", response_model=HeartbeatResponse)
+def heartbeat(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Heartbeat API [cite: 305]
+    - 클라이언트는 1분마다 이 API를 호출해야 함. [cite: 305]
+    - 호출 시 last_heartbeat 갱신 및 좀비 상태 해제. [cite: 306]
+    """
+    return AuthController.process_heartbeat(db, current_user)
+
+# ------------------------------------------------------------------
+# [신규 추가] 아이디 / 비밀번호 찾기 엔드포인트
+# ------------------------------------------------------------------
+
+@router.post("/find-id")
+def find_id(user_in: FindIdRequest, db: Session = Depends(get_db)):
+    """
+    아이디 찾기 API
+    - 휴대폰 번호를 통해 마스킹 처리된 아이디를 반환합니다.
+    """
+    return AuthController.find_username(db, user_in)
+
+@router.post("/reset-password")
+def reset_password(user_in: ResetPasswordRequest, db: Session = Depends(get_db)):
+    """
+    비밀번호 재설정 API
+    - 아이디와 번호가 일치하면 임시 비밀번호를 생성하여 SMS로 발송합니다.
+    """
+    return AuthController.reset_password(db, user_in)
+
+
+================================================================================
+FILE PATH: app\routers\sales.py
+================================================================================
+from datetime import date, datetime, timedelta
+import io
+import openpyxl
+from typing import Optional, List
+
+from fastapi import APIRouter, Depends, File, UploadFile, Form, Query, HTTPException
+from fastapi.responses import StreamingResponse
+from sqlalchemy.orm import Session
+
+from app.db import get_db
+from app.models.models import User, SalesReport
+from app.core.deps import get_current_user
+from app.controllers.sales_controller import SalesController
+from app.schemas.sales_schema import SalesReportResponse, MonthlySalesResponse, MonthlySalesSummary
+
+router = APIRouter()
+
+
+@router.post("/upload", response_model=SalesReportResponse)
+async def upload_sales_report(
+        report_date: Optional[date] = Form(None),
+        file: UploadFile = File(...),
+        db: Session = Depends(get_db),
+        current_user: User = Depends(get_current_user)
+):
+    return await SalesController.upload_sales(db, current_user, file, report_date)
+
+
+# [A5 추가] 월별 매출 조회
+@router.get("/monthly", response_model=MonthlySalesResponse)
+def get_monthly_sales(
+        month: str = Query(..., description="YYYY-MM format"),
+        db: Session = Depends(get_db),
+        current_user: User = Depends(get_current_user)
+):
+    try:
+        target_date = datetime.strptime(month, "%Y-%m")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid month format. Use YYYY-MM")
+
+    # 월의 시작일과 끝일 계산
+    start_date = date(target_date.year, target_date.month, 1)
+    if target_date.month == 12:
+        end_date = date(target_date.year + 1, 1, 1) - timedelta(days=1)
+    else:
+        end_date = date(target_date.year, target_date.month + 1, 1) - timedelta(days=1)
+
+    reports = db.query(SalesReport).filter(
+        SalesReport.user_id == current_user.id,
+        SalesReport.report_date >= start_date,
+        SalesReport.report_date <= end_date
+    ).order_by(SalesReport.report_date).all()
+
+    daily_logs = []
+    total_accumulated = 0
+
+    for r in reports:
+        total_accumulated += r.total_sales
+        daily_logs.append(MonthlySalesSummary(
+            date=str(r.report_date),
+            total_sales=r.total_sales,
+            platform_sales={
+                "hall": r.hall,
+                "baemin": r.baemin,
+                "coupang": r.coupang,
+                "yogiyo": r.yogiyo
+            }
+        ))
+
+    return MonthlySalesResponse(
+        month=month,
+        total_accumulated=total_accumulated,
+        daily_logs=daily_logs
+    )
+
+
+# [A5 추가] 엑셀 내보내기 (기간 지정)
+@router.get("/export")
+def export_sales_excel(
+        start: date,
+        end: date,
+        db: Session = Depends(get_db),
+        current_user: User = Depends(get_current_user)
+):
+    # [cite_start]1. 서버 최종 방어: 미래 날짜 요청 차단 [cite: 21]
+    if end > date.today():
+        raise HTTPException(status_code=400, detail="Cannot export future data.")
+
+    if start > end:
+        raise HTTPException(status_code=400, detail="Start date cannot be after end date.")
+
+    # 2. 데이터 조회
+    reports = db.query(SalesReport).filter(
+        SalesReport.user_id == current_user.id,
+        SalesReport.report_date >= start,
+        SalesReport.report_date <= end
+    ).order_by(SalesReport.report_date).all()
+
+    # 3. 엑셀 생성 (In-memory)
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "매출내역"
+    ws.append(["날짜", "총매출", "홀", "배달의민족", "쿠팡이츠", "요기요"])
+
+    for r in reports:
+        ws.append([str(r.report_date), r.total_sales, r.hall, r.baemin, r.coupang, r.yogiyo])
+
+    output = io.BytesIO()
+    wb.save(output)
+    output.seek(0)
+
+    filename = f"sales_{start}_{end}.xlsx"
+    headers = {'Content-Disposition': f'attachment; filename="{filename}"'}
+
+    return StreamingResponse(
+        output,
+        headers=headers,
+        media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+    )
+
+
+================================================================================
+FILE PATH: app\routers\system.py
+================================================================================
+from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy.orm import Session
+from typing import List
+from datetime import date
+
+from app.db import get_db
+from app.models.models import User, ReportNotification, Release
+from app.schemas.system import SystemVersion, ReportHistoryItem, ReportDetailResponse, ReleaseInfo, ReleaseCreate
+from app.core.deps import get_current_user
+from app.settings import settings
+
+# [중요] 라우터 생성
+router = APIRouter()
+
+
+# ---------------------------------------------------------
+# 1. System Info (경로 명시: /system/version)
+# ---------------------------------------------------------
+@router.get("/system/version", response_model=SystemVersion)
+def get_version():
+    return {
+        "version": settings.VERSION,
+        "status": "running",
+        "timezone": settings.TIMEZONE
+    }
+
+
+# ---------------------------------------------------------
+# 2. Reports (경로: /reports/...)
+# ---------------------------------------------------------
+@router.get("/reports/history", response_model=List[ReportHistoryItem])
+def get_report_history(
+        days: int = 10,
+        db: Session = Depends(get_db),
+        current_user: User = Depends(get_current_user)
+):
+    """최근 N일간의 리포트 알림 상태 요약"""
+    history = db.query(ReportNotification).filter(
+        ReportNotification.user_id == current_user.id
+    ).order_by(ReportNotification.report_date.desc()).limit(days).all()
+
+    return [
+        ReportHistoryItem(
+            report_date=h.report_date,
+            upload_status=h.upload_status,
+            primary_status=h.primary_status,
+            sent_at=h.updated_at
+        ) for h in history
+    ]
+
+
+@router.get("/reports/history/{report_date}", response_model=ReportDetailResponse)
+def get_report_detail(
+        report_date: date,
+        db: Session = Depends(get_db),
+        current_user: User = Depends(get_current_user)
+):
+    """특정 날짜 알림 상세"""
+    noti = db.query(ReportNotification).filter(
+        ReportNotification.user_id == current_user.id,
+        ReportNotification.report_date == report_date
+    ).first()
+
+    if not noti:
+        raise HTTPException(status_code=404, detail="No report found for this date")
+
+    return ReportDetailResponse(
+        report_date=noti.report_date,
+        upload_status=noti.upload_status,
+        primary_status=noti.primary_status,
+        sent_at=noti.updated_at,
+        primary_body=noti.primary_body,
+        error_message=noti.error_message
+    )
+
+
+# ---------------------------------------------------------
+# 3. Releases (경로: /releases)
+# ---------------------------------------------------------
+@router.get("/releases", response_model=List[ReleaseInfo])
+def get_releases(db: Session = Depends(get_db)):
+    return db.query(Release).order_by(Release.id.desc()).all()
+
+
+@router.post("/releases", response_model=ReleaseInfo, status_code=201)
+def create_release(
+        release_in: ReleaseCreate,
+        db: Session = Depends(get_db),
+        current_user: User = Depends(get_current_user)
+):
+    if current_user.role != "ADMIN":
+        raise HTTPException(status_code=403, detail="Only admins can publish releases")
+
+    existing = db.query(Release).filter(Release.version == release_in.version).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="Version already exists")
+
+    new_release = Release(
+        version=release_in.version,
+        description=release_in.description,
+        download_url=release_in.download_url,
+        is_mandatory=release_in.is_mandatory
+    )
+    db.add(new_release)
+    db.commit()
+    db.refresh(new_release)
+    return new_release
+
+
+================================================================================
+FILE PATH: app\routers\users.py
+================================================================================
+from fastapi import APIRouter, Depends
+from sqlalchemy.orm import Session
+from app.db import get_db
+from app.schemas.user_schema import UserResponse, UserUpdate
+from app.models.models import User
+from app.controllers.user_controller import UserController
+
+# [FIX] 이 줄이 없어서 에러가 났습니다. 반드시 추가해주세요.
+from app.core.deps import get_current_user
+
+router = APIRouter()
+
+@router.get("/me", response_model=UserResponse)
+def read_users_me(current_user: User = Depends(get_current_user)):
+    """
+    내 정보 조회 (Authentication 필수)
+    """
+    return UserController.get_me(current_user)
+
+@router.put("/profile", response_model=UserResponse)
+def update_user_profile(
+    user_in: UserUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    프로필 수정 (Authentication 필수)
+    """
+    return UserController.update_profile(db, current_user, user_in)
+
+
+================================================================================
+FILE PATH: app\routers\__init__.py
+================================================================================
+
+
+================================================================================
+FILE PATH: app\schemas\sales_schema.py
+================================================================================
+# app/schemas/sales_schema.py
+from pydantic import BaseModel
+from datetime import date
+from typing import List, Dict
+
+class SalesReportResponse(BaseModel):
+    report_id: int
+    report_date: date
+    hall: int
+    baemin: int
+    coupang: int
+    yogiyo: int
+    total_sales: int
+
+    class Config:
+        from_attributes = True
+
+# [A5 추가] 월별 조회용
+class MonthlySalesSummary(BaseModel):
+    date: str       # "2025-01-01"
+    total_sales: int
+    platform_sales: Dict[str, int] # {"baemin": 1000, ...}
+
+class MonthlySalesResponse(BaseModel):
+    month: str      # "2025-01"
+    total_accumulated: int
+    daily_logs: List[MonthlySalesSummary]
+
+
+================================================================================
+FILE PATH: app\schemas\system.py
+================================================================================
+from pydantic import BaseModel
+from typing import Optional, List
+from datetime import date, datetime
+
+
+class SystemVersion(BaseModel):
+    version: str
+    status: str
+    timezone: str
+
+
+class HeartbeatResponse(BaseModel):
+    status: str
+    last_heartbeat: str
+
+
+# [A5] 리포트 이력
+class ReportHistoryItem(BaseModel):
+    report_date: date
+    upload_status: str
+    primary_status: str
+    sent_at: Optional[datetime]
+
+
+class ReportDetailResponse(ReportHistoryItem):
+    primary_body: Optional[str]
+    error_message: Optional[str]
+
+
+# [A5] 릴리즈 정보
+class ReleaseInfo(BaseModel):
+    version: str
+    description: Optional[str]
+    download_url: str
+    is_mandatory: bool
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class ReleaseCreate(BaseModel):
+    version: str
+    # [수정] = None 을 추가하여 입력하지 않아도 에러가 나지 않게 함
+    description: Optional[str] = None
+    download_url: str
+    is_mandatory: bool = False
+
+
+================================================================================
+FILE PATH: app\schemas\user_schema.py
+================================================================================
+from pydantic import BaseModel
+from datetime import datetime
+from typing import Optional
+
+# [기존]
+class UserBase(BaseModel):
+    username: str
+    phone: str
+    store_name: str
+
+class UserCreate(UserBase):
+    password: str
+
+class UserResponse(UserBase):
+    id: int
+    store_uuid: str
+    created_at: datetime
+    class Config:
+        from_attributes = True
+
+# [NEW] 로그인 및 토큰
+class UserLogin(BaseModel):
+    username: str
+    password: str
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+
+
+# app/schemas/user_schema.py (기존 내용 아래에 추가)
+
+class UserUpdate(BaseModel):
+    phone: Optional[str] = None
+    store_name: Optional[str] = None
+
+    # 그 외 필드(username, role 등)가 들어오면 에러를 뱉거나 무시하도록 설정
+    # 명세의 "변경 거부"를 확실히 하기 위해, Pydantic 레벨에서 필터링합니다.
+    class Config:
+        extra = "forbid"  # 정의되지 않은 필드가 오면 422 Unprocessable Entity 발생 (사실상 거부)
+
+class FindIdRequest(BaseModel):
+    phone: str
+
+class ResetPasswordRequest(BaseModel):
+    username: str
+    phone: str
+
+
+================================================================================
+FILE PATH: app\schemas\__init__.py
+================================================================================
+
+
+================================================================================
+FILE PATH: app\services\monitoring.py
+================================================================================
+from datetime import datetime, timedelta, date  # date 추가
+from sqlalchemy import func  # DB 날짜 비교를 위해 추가
+from sqlalchemy.orm import Session
+from app.models.models import User, SystemLog
+from app.db import SessionLocal
+from app.settings import settings
+from app.services.notification import NotificationService
+
+
+class MonitoringService:
+    @staticmethod
+    def log_event(db: Session, type: str, level: str, message: str, meta: str = None):
+        """시스템 로그 적재 헬퍼 (기존 기능 유지)"""
+        try:
+            log = SystemLog(
+                type=type,
+                level=level,
+                source="SERVER",
+                message=message,
+                status="SUCCESS",
+                meta=meta
+            )
+            db.add(log)
+        except Exception as e:
+            print(f"[Log Error] {e}")
+
+    @staticmethod
+    def send_zombie_alert(db: Session, user: User):
+        """실제 Solapi SMS 발송 로직 연동 (기존 기능 유지)"""
+        return NotificationService.send_zombie_alert(db, user)
+
+    @staticmethod
+    def check_zombies():
+        """
+        주기적으로 실행되어 좀비를 감지합니다.
+        개선사항: 심야 발송 제한 + 오늘 신호가 있었던 매장만 감시
+        """
+        db = SessionLocal()
+        try:
+            now = datetime.now()
+
+            # [추가] 심야 발송 제한: 밤 10시 ~ 아침 8시 사이에는 문자를 보내지 않음
+            if now.hour >= 22 or now.hour < 8:
+                return
+
+            # 기준: 현재시간 - 60분
+            threshold = now - timedelta(minutes=60)
+            today_date = date.today()
+
+            # [수정] 조건:
+            # 1. 감시 활성 상태(is_offline_notified=True)
+            # 2. 하트비트 60분 경과
+            # 3. 마지막 신호가 '오늘' 발생 (새벽/휴무일 문자 방지)
+            zombies = db.query(User).filter(
+                User.is_offline_notified == True,
+                User.last_heartbeat < threshold,
+                func.date(User.last_heartbeat) == today_date
+            ).all()
+
+            if zombies:
+                print(f"[Monitoring] Detected {len(zombies)} zombies to notify today.")
+
+            for user in zombies:
+                # 1. SMS 발송 시도
+                sent = MonitoringService.send_zombie_alert(db, user)
+
+                # [수정] 사용자 요청: 문자 발송 후 False로 변경하여 오늘 더 이상 안 보냄
+                user.is_offline_notified = False
+                db.add(user)
+
+                if sent:
+                    MonitoringService.log_event(
+                        db,
+                        type="ZOMBIE_SMS",
+                        level="WARN",
+                        message=f"Zombie detected & Sent: {user.username} ({user.store_name})",
+                        meta=f'{{"user_id": {user.id}}}'
+                    )
+                else:
+                    print(f"[Monitoring] Failed to send SMS to {user.store_name}")
+                    MonitoringService.log_event(
+                        db,
+                        type="ZOMBIE_SMS",
+                        level="ERROR",
+                        message=f"Zombie SMS Failed: {user.username}",
+                        meta=f'{{"user_id": {user.id}}}'
+                    )
+
+            db.commit()
+
+        except Exception as e:
+            print(f"[Monitoring Error] {e}")
+            db.rollback()
+        finally:
+            db.close()
+
+    @staticmethod
+    def daily_reset():
+        """
+        [사용자 명세 반영] 00:05 리셋 시 모든 유저를 감시 가능 상태(True)로 변경
+        """
+        print("[Scheduler] Daily Reset Logic Executed at 00:05 (Set to True)")
+
+        db = SessionLocal()
+        try:
+            # 모든 유저의 알림 상태를 True(감시 대기)로 초기화
+            db.query(User).update({User.is_offline_notified: True})
+            db.commit()
+            print("[Scheduler] All users' monitoring status reset to True.")
+        except Exception as e:
+            print(f"[Reset Error] {e}")
+            db.rollback()
+        finally:
+            db.close()
+
+
+================================================================================
+FILE PATH: app\services\notification.py
+================================================================================
+import requests
+import json
+import datetime
+import hmac
+import hashlib
+import uuid
+from sqlalchemy.orm import Session
+
+# 프로젝트 내부 모듈 임포트
+from app.models.models import ReportNotification, User, SalesReport, SystemLog
+from app.settings import settings
+
+
+class NotificationService:
+    # ------------------------------------------------------------------
+    # [공통] Solapi API 인증 헤더 생성기
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _get_solapi_header():
+        """알림톡 및 SMS 발송을 위한 HMAC-SHA256 인증 헤더 생성"""
+        date_str = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        salt = str(uuid.uuid4())
+        data = date_str + salt
+        signature = hmac.new(
+            key=settings.SOLAPI_SECRET.encode("utf-8"),
+            msg=data.encode("utf-8"),
+            digestmod=hashlib.sha256
+        ).hexdigest()
+
+        return {
+            "Authorization": f"HMAC-SHA256 apiKey={settings.SOLAPI_KEY}, date={date_str}, salt={salt}, signature={signature}",
+            "Content-Type": "application/json"
+        }
+
+    # ------------------------------------------------------------------
+    # [1] 알림톡 관련 로직 (일일 매출 보고 -> 관리자에게 전송)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def send_daily_report(db: Session, user: User, report: SalesReport):
+        """
+        [일일 매출 보고] -> 알림톡
+        수신자: settings.MANAGER_PHONE (관리자)
+        """
+        body = (
+            f"[{user.store_name}] {report.report_date} 일일매출\n"
+            f"총 : {report.total_sales:,}\n\n"
+            f"홀 : {report.hall:,}\n"
+            f"배민 : {report.baemin:,}\n"
+            f"쿠팡 : {report.coupang:,}\n"
+            f"요기요 : {report.yogiyo:,}\n"
+            f"입니다."
+        )
+
+        # 이미 보낸 이력이 있는지 확인
+        notif = db.query(ReportNotification).filter(
+            ReportNotification.user_id == user.id,
+            ReportNotification.report_date == report.report_date
+        ).first()
+
+        if not notif:
+            notif = ReportNotification(
+                user_id=user.id,
+                report_date=report.report_date,
+                upload_status="RECEIVED",
+                primary_channel="ALIMTALK"
+            )
+            db.add(notif)
+
+        try:
+            url = "https://api.solapi.com/messages/v4/send"
+            headers = NotificationService._get_solapi_header()
+            data = {
+                "message": {
+                    "to": settings.MANAGER_PHONE,
+                    "from": settings.SENDER_PHONE,
+                    "text": body,
+                    "kakaoOptions": {
+                        "pfId": settings.KAKAO_PF_ID,
+                        "templateId": settings.KAKAO_TEMPLATE_ID,
+                        "disableSms": True
+                    }
+                }
+            }
+            resp = requests.post(url, headers=headers, json=data).json()
+
+            notif.primary_status = "SENT"
+            notif.primary_body = body
+            notif.provider_message_id = resp.get("messageId")
+            notif.updated_at = datetime.datetime.now()
+
+            db.add(SystemLog(type="ALIMTALK", level="INFO", source="SERVER", message="Daily report sent",
+                             status="SUCCESS"))
+            print(f"[ALIMTALK SUCCESS] MessageId: {resp.get('messageId')}")
+
+        except Exception as e:
+            error_msg = str(e)
+            notif.primary_status = "FAIL"
+            notif.error_message = error_msg
+            notif.updated_at = datetime.datetime.now()
+
+            db.add(
+                SystemLog(type="ALIMTALK", level="ERROR", source="SERVER", message=f"Fail: {error_msg}", status="FAIL"))
+            print(f"[ALIMTALK FAIL] {error_msg}")
+
+        db.commit()
+
+    # ------------------------------------------------------------------
+    # [2] 좀비 알림 로직 (PC 꺼짐 감지 -> 사장님에게 전송)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def send_zombie_alert(db: Session, user: User):
+        """
+        [좀비 와쳐 알림]
+        수신자: user.phone (해당 매장 사장님)
+        """
+        print(f"\n=== ?? 좀비 알림 발송 시작 (To Owner) ===")
+
+        if not user.phone:
+            error_msg = f"User {user.username} ({user.store_name}) has no phone number."
+            print(f"[ZOMBIE FAIL] {error_msg}")
+            db.add(SystemLog(type="ZOMBIE_SMS", level="ERROR", source="SERVER", message=error_msg, status="FAIL"))
+            db.commit()
+            return False
+
+        text_body = f"[{user.store_name}] 베지나이가 종료되었습니다. 다시 켜주세요."
+
+        try:
+            url = "https://api.solapi.com/messages/v4/send"
+            headers = NotificationService._get_solapi_header()
+            body = {
+                "message": {
+                    "to": user.phone,
+                    "from": settings.SENDER_PHONE,
+                    "text": text_body,
+                    "type": "SMS"
+                }
+            }
+
+            res = requests.post(url, headers=headers, json=body)
+
+            if res.status_code != 200:
+                raise Exception(f"Solapi API Error: {res.text}")
+
+            resp = res.json()
+            db.add(SystemLog(
+                type="ZOMBIE_SMS",
+                level="WARN",
+                source="SERVER",
+                message=f"Zombie Alert sent to {user.store_name}",
+                status="SUCCESS",
+                meta=f'{{"user_id": {user.id}, "phone": "{user.phone}"}}'
+            ))
+            db.commit()
+            print(f"[ZOMBIE SMS SUCCESS] MessageId: {resp.get('messageId')}")
+            return True
+
+        except Exception as e:
+            print(f"[ZOMBIE SMS FAIL] {str(e)}")
+            db.add(SystemLog(type="ZOMBIE_SMS", level="ERROR", source="SERVER", message=str(e), status="FAIL"))
+            db.commit()
+            return False
+
+    # ------------------------------------------------------------------
+    # [3] 공통 SMS 발송 함수 (아이디/비번 찾기용)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def send_generic_sms(phone: str, text: str) -> bool:
+        """
+        아이디 찾기나 임시 비밀번호 발급과 같은 일반 SMS 발송을 처리합니다.
+        """
+        try:
+            url = "https://api.solapi.com/messages/v4/send"
+            headers = NotificationService._get_solapi_header()
+            body = {
+                "message": {
+                    "to": phone,
+                    "from": settings.SENDER_PHONE,
+                    "text": text,
+                    "type": "SMS"
+                }
+            }
+
+            res = requests.post(url, headers=headers, json=body)
+            return res.status_code == 200
+
+        except Exception as e:
+            print(f"[GENERIC SMS FAIL] {str(e)}")
+            return False
+
+
+================================================================================
+FILE PATH: app\services\parser.py
+================================================================================
+import io
+import msoffcrypto
+import pandas as pd
+from datetime import date, datetime, timedelta
+from fastapi import UploadFile, HTTPException
+from app.settings import settings
+
+
+class ExcelParser:
+    @staticmethod
+    async def parse_sales_file(file: UploadFile):
+        # ---------------------------------------------------------
+        # ?? [추가] 파일명 검증: "매출리포트" 또는 "토스POS다운로드" 포함 여부
+        # ---------------------------------------------------------
+        filename = file.filename or "" #
+        if "매출리포트" not in filename and "토스POS다운로드" not in filename:
+            raise HTTPException(
+                status_code=400,
+                detail="지원하지 않는 파일명입니다. '매출리포트' 또는 '토스POS다운로드'가 포함된 파일만 처리 가능합니다."
+            )
+
+        # 1. 파일 준비 및 암호 해제 [cite: 370, 371]
+        file_content = await file.read()
+        file_io = io.BytesIO(file_content)
+        decrypted = io.BytesIO()
+        try:
+            office_file = msoffcrypto.OfficeFile(file_io)
+            office_file.load_key(password=settings.EXCEL_PASSWORD)
+            office_file.decrypt(decrypted)
+            decrypted.seek(0)
+        except Exception:
+            file_io.seek(0)
+            decrypted = file_io
+
+        # 2. 엑셀 읽기 [cite: 372]
+        try:
+            df = pd.read_excel(decrypted, sheet_name=settings.EXCEL_SHEET_NAME, header=None)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Excel parsing error: {str(e)}")
+
+        # 3. 메인 헤더 줄 찾기 ("결제수단별" 기준) [cite: 373]
+        top_header_idx = -1
+        for r_idx, row in df.iterrows():
+            row_str = " ".join([str(val) for val in row if pd.notna(val)])
+            if "결제수단별" in row_str:
+                top_header_idx = r_idx
+                break
+
+        if top_header_idx == -1 or top_header_idx + 1 >= len(df):
+            return {"hall": 0, "baemin": 0, "coupang": 0, "yogiyo": 0}
+
+        # 날짜 검증 로직: 다음날 정오까지 허용 [cite: 376, 377, 380]
+        try:
+            data_row = df.iloc[top_header_idx + 2]
+            raw_date = data_row[0]
+            excel_date = None
+
+            if isinstance(raw_date, (pd.Timestamp, datetime, date)):
+                excel_date = raw_date.date() if isinstance(raw_date, (pd.Timestamp, datetime)) else raw_date
+            elif isinstance(raw_date, str):
+                clean_date_str = raw_date.strip().replace('.', '-')
+                excel_date = datetime.strptime(clean_date_str, "%Y-%m-%d").date()
+
+            if excel_date:
+                now = datetime.now()
+                today = now.date()
+                yesterday = today - timedelta(days=1)
+
+                if excel_date == today:
+                    print(f"? 오늘 매출 확인: {excel_date}")
+                elif excel_date == yesterday:
+                    if now.hour < 12:
+                        print(f"? 어제 매출 확인 (정오 이전): {excel_date}")
+                    else:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"어제({excel_date}) 매출은 오늘 낮 12시까지만 보고 가능합니다."
+                        )
+                else:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"보고 가능한 날짜가 아닙니다. (엑셀 날짜: {excel_date})"
+                    )
+        except HTTPException as he:
+            raise he
+        except Exception as e:
+            print(f"?? 날짜 검증 건너뜀 (파싱 실패): {e}")
+
+        # 4. 컬럼 매핑 (부모-자식 구조)
+        top_row = df.iloc[top_header_idx]
+        sub_row = df.iloc[top_header_idx + 1]
+        col_mapping = []
+        current_parent = ""
+
+        for col_idx in range(len(df.columns)):
+            if pd.notna(top_row[col_idx]):
+                current_parent = str(top_row[col_idx]).strip()
+            child_name = str(sub_row[col_idx]).strip() if pd.notna(sub_row[col_idx]) else ""
+            col_mapping.append({"parent": current_parent, "name": child_name})
+
+        # 5. 데이터 합산 [cite: 385, 391]
+        hall_sales = 0
+        sales_baemin = 0
+        sales_coupang = 0
+        sales_yogiyo = 0
+
+        baemin_keys = ["plugin_baemin", "baemin", "배민", "배달의 민족"]
+        coupang_keys = ["plugin_coupang", "coupang", "쿠팡이츠", "쿠팡", "coupang eats"]
+        yogiyo_keys = ["yogiyo", "plugin_yogiyo", "요기요"]
+
+        for i in range(top_header_idx + 2, len(df)):
+            curr_row = df.iloc[i]
+            if not "".join([str(v) for v in curr_row if pd.notna(v)]).strip(): continue
+
+            for col_idx in range(len(curr_row)):
+                info = col_mapping[col_idx]
+                parent = info["parent"]
+                name = info["name"]
+                val = curr_row[col_idx]
+
+                if pd.isna(val): continue
+                try:
+                    amount = int(float(str(val).replace(",", "").replace("원", "").strip()))
+                except:
+                    continue
+                if amount == 0: continue
+
+                if parent == "결제수단별":
+                    if name in ["현금", "카드", "QR결제", "계좌이체"]:
+                        hall_sales += amount
+                elif parent == "매입사별":
+                    low_name = name.lower()
+                    if any(k in low_name for k in baemin_keys):
+                        sales_baemin += amount
+                    elif any(k in low_name for k in coupang_keys):
+                        sales_coupang += amount
+                    elif any(k in low_name for k in yogiyo_keys):
+                        sales_yogiyo += amount
+
+        return {
+            "hall": hall_sales,
+            "baemin": sales_baemin,
+            "coupang": sales_coupang,
+            "yogiyo": sales_yogiyo
+        }
+
+
+================================================================================
+FILE PATH: app\services\__init__.py
+================================================================================
+
+
+================================================================================
+FILE PATH: app\db.py
+================================================================================
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker, declarative_base # [수정] 최신 버전에 맞춰 import 방식 조정
+from .settings import settings
+
+# [수정] SQLite일 때만 check_same_thread 옵션 적용
+connect_args = {}
+if settings.DATABASE_URL.startswith("sqlite"):
+    connect_args = {"check_same_thread": False}
+
+engine = create_engine(settings.DATABASE_URL, connect_args=connect_args)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+================================================================================
+FILE PATH: app\main.py
+================================================================================
+import uvicorn
+from contextlib import asynccontextmanager
+from fastapi import FastAPI
+from apscheduler.schedulers.background import BackgroundScheduler
+from app.routers import system, auth, users, sales
+from app.settings import settings
+from app.services.monitoring import MonitoringService
+
+# 스케줄러 설정
+scheduler = BackgroundScheduler(timezone=settings.TIMEZONE)
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # 앱 시작 시 스케줄러 시작
+    scheduler.add_job(MonitoringService.check_zombies, 'interval', minutes=1, id='check_zombies')
+    scheduler.add_job(MonitoringService.daily_reset, 'cron', hour=0, minute=5, id='daily_reset')
+    scheduler.start()
+    print("--- [System] Monitoring Scheduler Started ---")
+    yield
+    scheduler.shutdown()
+    print("--- [System] Monitoring Scheduler Shutdown ---")
+
+app = FastAPI(title=settings.PROJECT_NAME, lifespan=lifespan)
+
+# [수정됨] system 라우터의 prefix를 '/api/v1'으로 변경 (기존 '/api/v1/system' 제거)
+app.include_router(system.router, prefix=settings.API_V1_STR, tags=["System & Reports"])
+
+# 나머지 라우터는 기존 유지
+app.include_router(auth.router, prefix=f"{settings.API_V1_STR}/auth", tags=["auth"])
+app.include_router(users.router, prefix=f"{settings.API_V1_STR}/users", tags=["users"])
+app.include_router(sales.router, prefix=f"{settings.API_V1_STR}/sales", tags=["sales"])
+
+@app.get("/")
+def root():
+    return {"message": "Vegenie API Server is running"}
+
+if __name__ == "__main__":
+    uvicorn.run("app.main:app", host="0.0.0.0", port=8000, reload=True)
+
+
+================================================================================
+FILE PATH: app\settings.py
+================================================================================
+from pydantic_settings import BaseSettings
+import os # [추가]
+
+class Settings(BaseSettings):
+    PROJECT_NAME: str = "Vegenie"
+    VERSION: str = "v0.2.5"
+    API_V1_STR: str = "/api/v1"
+
+    TIMEZONE: str = "Asia/Seoul"
+    DATABASE_URL: str = "sqlite:///./vegenie.db"
+
+    # 엑셀 파싱 계약
+    EXCEL_PASSWORD: str = "7055"
+    EXCEL_SHEET_NAME: str = "결제 합계"
+
+    # JWT 설정
+    SECRET_KEY: str = "vegenie-secret-key-change-this-in-prod"
+    ALGORITHM: str = "HS256"
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24 * 7
+
+    # --------------------------------------------------------
+    # [G. 알림/운영 고정값] - Solapi & Kakao Real Keys
+    # --------------------------------------------------------
+    # Solapi API Key
+    SOLAPI_KEY: str = "NCS4COIDQ681XXPL"
+    SOLAPI_SECRET: str = "4IWZDH2PMMQJXBZRDRA5Z7SQUTP8VFSX"
+
+    # Kakao AlimTalk IDs
+    KAKAO_PF_ID: str = "KA01PF251225055208641PWbN0JWVOo8"
+    KAKAO_TEMPLATE_ID: str = "KA01TP2512271353576383sumVHXbRGu"
+
+    # Phone Numbers
+    MANAGER_PHONE: str = "01021123558"  # 수신자
+    SENDER_PHONE: str = "01021123558"  # 발신자 (Solapi에 등록된 번호여야 함)
+
+    # [수정] 환경변수 'DATABASE_URL'이 있으면 그걸 쓰고, 없으면 기존 SQLite 사용 (로컬 테스트용)
+    DATABASE_URL: str = os.getenv("DATABASE_URL", "sqlite:///./vegenie.db")
+
+settings = Settings()
+
+
+================================================================================
+FILE PATH: app\__init__.py
+================================================================================
+
+
+================================================================================
+FILE PATH: docker-compose.yml
+================================================================================
+version: '3.8'
+
+services:
+  # 1. PostgreSQL 데이터베이스
+  db:
+    image: postgres:15-alpine
+    container_name: vegenie-db
+    restart: always
+    environment:
+      - POSTGRES_USER=vegenie_user
+      - POSTGRES_PASSWORD=vegenie_pass
+      - POSTGRES_DB=vegenie_db
+      - TZ=Asia/Seoul
+    volumes:
+      - postgres_data:/var/lib/postgresql/data  # DB 데이터 영구 저장
+    ports:
+      - "5432:5432"  # (선택) 로컬에서 DB 접속하고 싶을 때
+
+  # 2. Vegenie 서버
+  backend:
+    build: .
+    container_name: vegenie-server
+    restart: always
+    depends_on:
+      - db
+    ports:
+      - "8000:8000"
+    environment:
+      # [중요] Postgres 연결 문자열 (user:pass@container_name:port/db_name)
+      - DATABASE_URL=postgresql://vegenie_user:vegenie_pass@db:5432/vegenie_db
+
+      # [설정] 기존 키 값들 (settings.py가 이걸 읽음)
+      - SECRET_KEY=vegenie-secret-key-prod-change-me
+      - SOLAPI_KEY=NCS4COIDQ681XXPL
+      - SOLAPI_SECRET=4IWZDH2PMMQJXBZRDRA5Z7SQUTP8VFSX
+      - TIMEZONE=Asia/Seoul
+      - TZ=Asia/Seoul
+
+volumes:
+  postgres_data:
+
+
+================================================================================
+FILE PATH: Dockerfile
+================================================================================
+# 1. 가볍고 안정적인 Python 3.10 버전 사용
+FROM python:3.10-slim
+
+# 2. 타임존 설정 (한국 시간) - 좀비 감지 로직 필수!
+ENV TZ=Asia/Seoul
+RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
+
+# 3. 작업 디렉토리 설정
+WORKDIR /app
+
+# 4. 의존성 파일 복사 및 설치
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# 5. 소스 코드 전체 복사
+COPY . .
+
+# 6. 실행 명령어 (Uvicorn 실행)
+# host 0.0.0.0은 컨테이너 외부 접속 허용을 위해 필수
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+
+
+================================================================================
+FILE PATH: init_db.py
+================================================================================
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
+from app.db import Base, engine
+from app.models.models import User, SalesReport
+
+def init_db():
+    print("Vegenie DB 초기화 중...")
+    Base.metadata.create_all(bind=engine)
+    print("테이블 생성 완료: users, sales_reports")
+
+if __name__ == "__main__":
+    init_db()
+
+
+
+================================================================================
+FILE PATH: requirements.txt
+================================================================================
+fastapi
+uvicorn
+sqlalchemy
+pydantic
+pydantic-settings
+python-jose[cryptography]
+python-multipart
+requests
+openpyxl
+pandas
+msoffcrypto-tool
+apscheduler
+psycopg2-binary
+
+# [수정] passlib와 bcrypt 버전을 분리해서 명시
+passlib
+bcrypt==4.0.1
+
+
+================================================================================
+FILE PATH: server_code_snapshot.txt
+================================================================================
+[Server Code Snapshot]
+Date: 01/14/2026 09:41:54
+==============================================================================
+
+
+==============================================================================
+?? FILE: \docker-compose.yml
+==============================================================================
+version: '3.8'
+
+services:
+  # 1. PostgreSQL ??이??베??스
+  db:
+    image: postgres:15-alpine
+    container_name: vegenie-db
+    restart: always
+    environment:
+      - POSTGRES_USER=vegenie_user
+      - POSTGRES_PASSWORD=vegenie_pass
+      - POSTGRES_DB=vegenie_db
+      - TZ=Asia/Seoul
+    volumes:
+      - postgres_data:/var/lib/postgresql/data  # DB ??이????구 ????
+    ports:
+      - "5432:5432"  # (??택) 로컬??서 DB ??속??고 ??을 ??
+
+  # 2. Vegenie ??버
+  backend:
+    build: .
+    container_name: vegenie-server
+    restart: always
+    depends_on:
+      - db
+    ports:
+      - "8000:8000"
+    environment:
+      # [중요] Postgres ??결 문자??(user:pass@container_name:port/db_name)
+      - DATABASE_URL=postgresql://vegenie_user:vegenie_pass@db:5432/vegenie_db
+
+      # [??정] 기존 ??값들 (settings.py가 ??걸 ??음)
+      - SECRET_KEY=vegenie-secret-key-prod-change-me
+      - SOLAPI_KEY=NCS4COIDQ681XXPL
+      - SOLAPI_SECRET=4IWZDH2PMMQJXBZRDRA5Z7SQUTP8VFSX
+      - TIMEZONE=Asia/Seoul
+      - TZ=Asia/Seoul
+
+volumes:
+  postgres_data:
+
+
+==============================================================================
+?? FILE: \init_db.py
+==============================================================================
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
+from app.db import Base, engine
+from app.models.models import User, SalesReport
+
+def init_db():
+    print("Vegenie DB ???? ??...")
+    Base.metadata.create_all(bind=engine)
+    print("????? ???? ???: users, sales_reports")
+
+if __name__ == "__main__":
+    init_db()
+
+
+
+==============================================================================
+?? FILE: \app\db.py
+==============================================================================
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker, declarative_base # [????] ??? ?????? ???? import ??? ????
+from .settings import settings
+
+# [????] SQLite?? ???? check_same_thread ??? ????
+connect_args = {}
+if settings.DATABASE_URL.startswith("sqlite"):
+    connect_args = {"check_same_thread": False}
+
+engine = create_engine(settings.DATABASE_URL, connect_args=connect_args)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+==============================================================================
+?? FILE: \app\main.py
+==============================================================================
+import uvicorn
+from contextlib import asynccontextmanager
+from fastapi import FastAPI
+from apscheduler.schedulers.background import BackgroundScheduler
+from app.routers import system, auth, users, sales
+from app.settings import settings
+from app.services.monitoring import MonitoringService
+
+# ??????? ????
+scheduler = BackgroundScheduler(timezone=settings.TIMEZONE)
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # ?? ???? ?? ??????? ????
+    scheduler.add_job(MonitoringService.check_zombies, 'interval', minutes=1, id='check_zombies')
+    scheduler.add_job(MonitoringService.daily_reset, 'cron', hour=0, minute=5, id='daily_reset')
+    scheduler.start()
+    print("--- [System] Monitoring Scheduler Started ---")
+    yield
+    scheduler.shutdown()
+    print("--- [System] Monitoring Scheduler Shutdown ---")
+
+app = FastAPI(title=settings.PROJECT_NAME, lifespan=lifespan)
+
+# [??????] system ??????? prefix?? '/api/v1'???? ???? (???? '/api/v1/system' ????)
+app.include_router(system.router, prefix=settings.API_V1_STR, tags=["System & Reports"])
+
+# ?????? ?????? ???? ????
+app.include_router(auth.router, prefix=f"{settings.API_V1_STR}/auth", tags=["auth"])
+app.include_router(users.router, prefix=f"{settings.API_V1_STR}/users", tags=["users"])
+app.include_router(sales.router, prefix=f"{settings.API_V1_STR}/sales", tags=["sales"])
+
+@app.get("/")
+def root():
+    return {"message": "Vegenie API Server is running"}
+
+if __name__ == "__main__":
+    uvicorn.run("app.main:app", host="0.0.0.0", port=8000, reload=True)
+
+
+==============================================================================
+?? FILE: \app\settings.py
+==============================================================================
+from pydantic_settings import BaseSettings
+import os # [???]
+
+class Settings(BaseSettings):
+    PROJECT_NAME: str = "Vegenie"
+    VERSION: str = "v0.2.5"
+    API_V1_STR: str = "/api/v1"
+
+    TIMEZONE: str = "Asia/Seoul"
+    DATABASE_URL: str = "sqlite:///./vegenie.db"
+
+    # ???? ??? ???
+    EXCEL_PASSWORD: str = "7055"
+    EXCEL_SHEET_NAME: str = "???? ???"
+
+    # JWT ????
+    SECRET_KEY: str = "vegenie-secret-key-change-this-in-prod"
+    ALGORITHM: str = "HS256"
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24 * 7
+
+    # --------------------------------------------------------
+    # [G. ???/?? ??????] - Solapi & Kakao Real Keys
+    # --------------------------------------------------------
+    # Solapi API Key
+    SOLAPI_KEY: str = "NCS4COIDQ681XXPL"
+    SOLAPI_SECRET: str = "4IWZDH2PMMQJXBZRDRA5Z7SQUTP8VFSX"
+
+    # Kakao AlimTalk IDs
+    KAKAO_PF_ID: str = "KA01PF251225055208641PWbN0JWVOo8"
+    KAKAO_TEMPLATE_ID: str = "KA01TP2512271353576383sumVHXbRGu"
+
+    # Phone Numbers
+    MANAGER_PHONE: str = "01089993264"  # ??????
+    SENDER_PHONE: str = "01021123558"  # ????? (Solapi?? ???? ??????? ??)
+
+    # [????] ??溯?? 'DATABASE_URL'?? ?????? ??? ????, ?????? ???? SQLite ??? (???? ??????)
+    DATABASE_URL: str = os.getenv("DATABASE_URL", "sqlite:///./vegenie.db")
+
+settings = Settings()
+
+
+==============================================================================
+?? FILE: \app\__init__.py
+==============================================================================
+
+
+==============================================================================
+?? FILE: \app\controllers\auth_controller.py
+==============================================================================
+# app/controllers/auth_controller.py
+from sqlalchemy.orm import Session
+from fastapi import HTTPException, status
+from app.models.models import User
+from app.schemas.user_schema import UserCreate, UserLogin
+from app.core.security import get_password_hash, verify_password, create_access_token
+from app.settings import settings
+from datetime import timedelta
+from datetime import datetime
+
+class AuthController:
+    @staticmethod
+    def register_user(db: Session, user_in: UserCreate):
+        # 1. Username 중복 체크
+        existing_user = db.query(User).filter(User.username == user_in.username).first()
+        if existing_user:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Username already exists"
+            )
+
+        # 2. 비??번호 ??싱 ??User 객체 ??성
+        # [cite_start]store_uuid??Model??default=uuid.uuid4()????해 ??동 ??성 (??버 권위) [cite: 19]
+        db_user = User(
+            username=user_in.username,
+            password_hash=get_password_hash(user_in.password),
+            phone=user_in.phone,
+            store_name=user_in.store_name,
+            role="OWNER"
+        )
+
+        db.add(db_user)
+        db.commit()
+        db.refresh(db_user)
+        return db_user
+
+    @staticmethod
+    def login_user(db: Session, user_in: UserLogin):
+        # 1. ???? 조회
+        user = db.query(User).filter(User.username == user_in.username).first()
+        if not user:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Incorrect username or password",
+            )
+
+        # 2. 비??번호 검??
+        if not verify_password(user_in.password, user.password_hash):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Incorrect username or password",
+            )
+
+        # 3. ??큰 발급
+        access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+        access_token = create_access_token(
+            data={"sub": user.username, "user_id": user.id},  # user_id ??함
+            expires_delta=access_token_expires
+        )
+
+        return {
+            "access_token": access_token,
+            "token_type": "bearer"
+        }
+
+    @staticmethod
+    def process_heartbeat(db: Session, current_user: User):
+        # 1. 마??????신 ??간 갱신
+        current_user.last_heartbeat = datetime.now()
+
+        # 2. 좀????태????면 ??제 (??수????is_offline_notified=False)
+        if current_user.is_offline_notified:
+            current_user.is_offline_notified = False
+
+            # (??택) 복구 로그 ??기??
+            # MonitoringService.log_event(...)
+
+        db.add(current_user)
+        db.commit()
+        db.refresh(current_user)
+
+        return {
+            "status": "alive",
+            "last_heartbeat": str(current_user.last_heartbeat)
+        }
+
+
+==============================================================================
+?? FILE: \app\controllers\sales_controller.py
+==============================================================================
+# app/controllers/sales_controller.py
+from datetime import date
+from sqlalchemy.orm import Session
+from fastapi import UploadFile, HTTPException
+from app.models.models import User, SalesReport, SystemLog
+from app.services.parser import ExcelParser
+from app.services.notification import NotificationService
+
+class SalesController:
+    @staticmethod
+    async def upload_sales(db: Session, current_user: User, file: UploadFile, report_date: date = None):
+        # -------------------------------------------------------
+        # [cite_start]Step 1) report_date ??정/검??(??버 권위) [cite: 21]
+        # -------------------------------------------------------
+        server_today = date.today()
+
+        if report_date is None:
+            # 미제??????버 today????정
+            final_date = server_today
+        else:
+            # ??공 ??검?? 불일??400
+            if report_date != server_today:
+                raise HTTPException(status_code=400, detail="Report date must match server today.")
+            final_date = report_date
+
+        # -------------------------------------------------------
+        # Step 2~5) ???? ??싱 (기존 로직 ??일)
+        # -------------------------------------------------------
+        try:
+            parsed = await ExcelParser.parse_sales_file(file)
+        except HTTPException as he:
+            raise he  # 400 ??러??그??????달
+        except Exception as e:
+            db.add(SystemLog(type="UPLOAD", level="ERROR", source="SERVER", message=f"Parse Error: {str(e)}",
+                             status="FAIL"))
+            db.commit()
+            raise HTTPException(status_code=400, detail="Excel parsing failed")
+
+        # -------------------------------------------------------
+        # [cite_start]Step 7) Total ??계??(SSOT) [cite: 9]
+        # -------------------------------------------------------
+        total = parsed["hall"] + parsed["baemin"] + parsed["coupang"] + parsed["yogiyo"]
+
+        # -------------------------------------------------------
+        # [cite_start]Step 6) sales_reports upsert [cite: 21]
+        # -------------------------------------------------------
+        report = db.query(SalesReport).filter(
+            SalesReport.user_id == current_user.id,
+            SalesReport.report_date == final_date
+        ).first()
+
+        if not report:
+            report = SalesReport(user_id=current_user.id, report_date=final_date)
+
+        report.hall = parsed["hall"]
+        report.baemin = parsed["baemin"]
+        report.coupang = parsed["coupang"]
+        report.yogiyo = parsed["yogiyo"]
+        report.total_sales = total
+
+        db.add(report)
+        db.commit()
+        db.refresh(report)  # ID ??득
+
+        # -------------------------------------------------------
+        # [cite_start]Step 8) report_notifications + ??림??발송 [cite: 16]
+        # ??책: ??림 ??패??도 ??로??는 200 ???? (Try-Except ???? 처리)
+        # -------------------------------------------------------
+        NotificationService.send_daily_report(db, current_user, report)
+
+        # -------------------------------------------------------
+        # [cite_start]Step 9) System Log [cite: 21]
+        # -------------------------------------------------------
+        db.add(SystemLog(
+            type="UPLOAD",
+            level="INFO",
+            source="SERVER",
+            message="Upload & Parsing Success",
+            status="SUCCESS",
+            meta=f'{{"report_id": {report.report_id}, "total": {total}}}'
+        ))
+        db.commit()
+
+        return report
+
+    @staticmethod
+    def _log(db, level, msg, user):
+        # ??스??로그 ??재 ??퍼 (모델??SystemLog가 ??어????
+        try:
+            log = SystemLog(
+                type="UPLOAD",
+                level=level,
+                source="SERVER",
+                message=msg,
+                status="SUCCESS" if level == "INFO" else "FAIL",
+                meta=f'{{"user_id": {user.id}}}'
+            )
+            db.add(log)
+            # ??기??commit?? 메인 ??랜????????께 처리??도????
+        except:
+            pass  # 로그 ??패가 로직??막?? ??게
+
+
+==============================================================================
+?? FILE: \app\controllers\user_controller.py
+==============================================================================
+# app/controllers/user_controller.py
+from sqlalchemy.orm import Session
+from fastapi import HTTPException, status
+from app.models.models import User
+from app.schemas.user_schema import UserUpdate
+
+
+class UserController:
+    @staticmethod
+    def get_me(current_user: User):
+        # ??재 로그??한 ??용??객체 반환
+        return current_user
+
+    @staticmethod
+    def update_profile(db: Session, current_user: User, user_in: UserUpdate):
+        # 명세: phone/store_name??변????용 (??이??리??트)
+        # ??키??UserUpdate)??서 ???? ??터링되지?? 로직??서??명시??으??처리
+
+        updates_made = False
+
+        if user_in.phone is not None:
+            current_user.phone = user_in.phone
+            updates_made = True
+
+        if user_in.store_name is not None:
+            current_user.store_name = user_in.store_name
+            updates_made = True
+
+        if updates_made:
+            db.add(current_user)
+            db.commit()
+            db.refresh(current_user)
+
+        return current_user
+
+
+==============================================================================
+?? FILE: \app\controllers\__init__.py
+==============================================================================
+
+
+==============================================================================
+?? FILE: \app\core\deps.py
+==============================================================================
+# app/core/deps.py
+from typing import Generator, Optional
+from fastapi import Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordBearer
+from jose import jwt, JWTError
+from sqlalchemy.orm import Session
+from app.db import get_db
+from app.models.models import User
+from app.settings import settings
+
+# ??큰 URL?? Swagger UI??(??제??/api/v1/auth/login)
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl=f"{settings.API_V1_STR}/auth/login")
+
+
+def get_current_user(
+        db: Session = Depends(get_db),
+        token: str = Depends(oauth2_scheme)
+) -> User:
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
+        username: str = payload.get("sub")
+        if username is None:
+            raise credentials_exception
+    except JWTError:
+        raise credentials_exception
+
+    user = db.query(User).filter(User.username == username).first()
+    if user is None:
+        raise credentials_exception
+    return user
+
+
+==============================================================================
+?? FILE: \app\core\security.py
+==============================================================================
+# app/core/security.py
+from datetime import datetime, timedelta
+from typing import Optional
+from passlib.context import CryptContext
+from jose import jwt
+from app.settings import settings
+
+# passlib + bcrypt ??환????정
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    return pwd_context.verify(plain_password, hashed_password)
+
+
+def get_password_hash(password: str) -> str:
+    return pwd_context.hash(password)
+
+
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(minutes=15)
+
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
+    return encoded_jwt
+
+
+==============================================================================
+?? FILE: \app\models\models.py
+==============================================================================
+from sqlalchemy import Column, Integer, String, DateTime, Boolean, ForeignKey, UniqueConstraint, Date, Text
+from sqlalchemy.sql import func
+import uuid
+from app.db import Base
+
+
+class User(Base):
+    __tablename__ = "users"
+    id = Column(Integer, primary_key=True, index=True)
+    username = Column(String, unique=True, index=True)
+    password_hash = Column(String)
+    phone = Column(String)
+    store_name = Column(String)
+    store_uuid = Column(String, unique=True, default=lambda: str(uuid.uuid4()))
+    role = Column(String, default="OWNER")
+    last_heartbeat = Column(DateTime, nullable=True)
+    is_offline_notified = Column(Boolean, default=False)
+    created_at = Column(DateTime, server_default=func.now())
+
+
+class SalesReport(Base):
+    __tablename__ = "sales_reports"
+    report_id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"))
+    report_date = Column(Date)
+    hall = Column(Integer, default=0)
+    baemin = Column(Integer, default=0)
+    coupang = Column(Integer, default=0)
+    yogiyo = Column(Integer, default=0)
+    total_sales = Column(Integer, default=0)
+
+    __table_args__ = (UniqueConstraint('user_id', 'report_date', name='_user_date_uc'),)
+
+
+class SystemLog(Base):
+    __tablename__ = "system_logs"
+    log_id = Column(Integer, primary_key=True, index=True)
+    type = Column(String)  # LOGIN, ERROR, ZOMBIE_SMS ??
+    level = Column(String)  # INFO, WARN, ERROR
+    source = Column(String)  # SERVER, CLIENT
+    message = Column(String)
+    status = Column(String)  # SUCCESS, FAIL
+    meta = Column(String, nullable=True)  # JSON String
+    timestamp = Column(DateTime, server_default=func.now())
+
+
+class ReportNotification(Base):
+    __tablename__ = "report_notifications"
+    notif_id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"))
+    report_date = Column(Date)
+    upload_status = Column(String, default="RECEIVED")
+    primary_channel = Column(String, default="ALIMTALK")
+    primary_status = Column(String, nullable=True)
+    primary_body = Column(String, nullable=True)
+
+    # [??????] ?? ??? ???? ?????? ???????. ?? ??????? ????!
+    error_message = Column(String, nullable=True)
+
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, onupdate=func.now())
+
+    __table_args__ = (UniqueConstraint('user_id', 'report_date', name='_user_date_notif_uc'),)
+
+
+# [??? ???] ???? ?????? ?????
+class Release(Base):
+    __tablename__ = "releases"
+
+    id = Column(Integer, primary_key=True, index=True)
+    version = Column(String, unique=True, index=True)  # ??: "1.0.2"
+    description = Column(Text, nullable=True)  # ??????? ????
+    download_url = Column(String, nullable=False)  # ??????? ???
+    is_mandatory = Column(Boolean, default=False)  # ???? ??????? ????
+    created_at = Column(DateTime, server_default=func.now())
+
+
+==============================================================================
+?? FILE: \app\models\__init__.py
+==============================================================================
+
+
+==============================================================================
+?? FILE: \app\routers\auth.py
+==============================================================================
+from fastapi import APIRouter, Depends
+from sqlalchemy.orm import Session
+from app.db import get_db
+from app.schemas.user_schema import UserCreate, UserResponse, UserLogin, Token
+from app.controllers.auth_controller import AuthController
+from app.models.models import User
+from app.core.deps import get_current_user
+from app.schemas.system import HeartbeatResponse
+
+router = APIRouter()
+
+@router.post("/register", response_model=UserResponse, status_code=201)
+def register(user_in: UserCreate, db: Session = Depends(get_db)):
+    """
+    ??원가??API
+    - store_uuid????버??서 ??동 ??성??니??
+    - password??bcrypt????싱??어 ????됩??다.
+    """
+    return AuthController.register_user(db, user_in)
+
+@router.post("/login", response_model=Token)
+def login(user_in: UserLogin, db: Session = Depends(get_db)):
+    """
+    로그??API
+    - JWT Access Token??발급??니??
+    """
+    return AuthController.login_user(db, user_in)
+
+@router.post("/heartbeat", response_model=HeartbeatResponse)
+def heartbeat(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Heartbeat API
+    - ??라??언??는 1분마????API????출??야 ??
+    - ??출 ??last_heartbeat 갱신 ??좀????태 ??제.
+    """
+    return AuthController.process_heartbeat(db, current_user)
+
+
+==============================================================================
+?? FILE: \app\routers\sales.py
+==============================================================================
+from datetime import date, datetime, timedelta
+import io
+import openpyxl
+from typing import Optional, List
+
+from fastapi import APIRouter, Depends, File, UploadFile, Form, Query, HTTPException
+from fastapi.responses import StreamingResponse
+from sqlalchemy.orm import Session
+
+from app.db import get_db
+from app.models.models import User, SalesReport
+from app.core.deps import get_current_user
+from app.controllers.sales_controller import SalesController
+from app.schemas.sales_schema import SalesReportResponse, MonthlySalesResponse, MonthlySalesSummary
+
+router = APIRouter()
+
+
+@router.post("/upload", response_model=SalesReportResponse)
+async def upload_sales_report(
+        report_date: Optional[date] = Form(None),
+        file: UploadFile = File(...),
+        db: Session = Depends(get_db),
+        current_user: User = Depends(get_current_user)
+):
+    return await SalesController.upload_sales(db, current_user, file, report_date)
+
+
+# [A5 추??] ??별 매출 조회
+@router.get("/monthly", response_model=MonthlySalesResponse)
+def get_monthly_sales(
+        month: str = Query(..., description="YYYY-MM format"),
+        db: Session = Depends(get_db),
+        current_user: User = Depends(get_current_user)
+):
+    try:
+        target_date = datetime.strptime(month, "%Y-%m")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid month format. Use YYYY-MM")
+
+    # ??의 ??작??과 ??일 계산
+    start_date = date(target_date.year, target_date.month, 1)
+    if target_date.month == 12:
+        end_date = date(target_date.year + 1, 1, 1) - timedelta(days=1)
+    else:
+        end_date = date(target_date.year, target_date.month + 1, 1) - timedelta(days=1)
+
+    reports = db.query(SalesReport).filter(
+        SalesReport.user_id == current_user.id,
+        SalesReport.report_date >= start_date,
+        SalesReport.report_date <= end_date
+    ).order_by(SalesReport.report_date).all()
+
+    daily_logs = []
+    total_accumulated = 0
+
+    for r in reports:
+        total_accumulated += r.total_sales
+        daily_logs.append(MonthlySalesSummary(
+            date=str(r.report_date),
+            total_sales=r.total_sales,
+            platform_sales={
+                "hall": r.hall,
+                "baemin": r.baemin,
+                "coupang": r.coupang,
+                "yogiyo": r.yogiyo
+            }
+        ))
+
+    return MonthlySalesResponse(
+        month=month,
+        total_accumulated=total_accumulated,
+        daily_logs=daily_logs
+    )
+
+
+# [A5 추??] ???? ??보??기 (기간 지??
+@router.get("/export")
+def export_sales_excel(
+        start: date,
+        end: date,
+        db: Session = Depends(get_db),
+        current_user: User = Depends(get_current_user)
+):
+    # [cite_start]1. ??버 최종 방어: 미래 ??짜 ??청 차단 [cite: 21]
+    if end > date.today():
+        raise HTTPException(status_code=400, detail="Cannot export future data.")
+
+    if start > end:
+        raise HTTPException(status_code=400, detail="Start date cannot be after end date.")
+
+    # 2. ??이??조회
+    reports = db.query(SalesReport).filter(
+        SalesReport.user_id == current_user.id,
+        SalesReport.report_date >= start,
+        SalesReport.report_date <= end
+    ).order_by(SalesReport.report_date).all()
+
+    # 3. ???? ??성 (In-memory)
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "매출??역"
+    ws.append(["??짜", "총매??, "??", "배달??????, "쿠팡??츠", "??기??])
+
+    for r in reports:
+        ws.append([str(r.report_date), r.total_sales, r.hall, r.baemin, r.coupang, r.yogiyo])
+
+    output = io.BytesIO()
+    wb.save(output)
+    output.seek(0)
+
+    filename = f"sales_{start}_{end}.xlsx"
+    headers = {'Content-Disposition': f'attachment; filename="{filename}"'}
+
+    return StreamingResponse(
+        output,
+        headers=headers,
+        media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+    )
+
+
+==============================================================================
+?? FILE: \app\routers\system.py
+==============================================================================
+from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy.orm import Session
+from typing import List
+from datetime import date
+
+from app.db import get_db
+from app.models.models import User, ReportNotification, Release
+from app.schemas.system import SystemVersion, ReportHistoryItem, ReportDetailResponse, ReleaseInfo, ReleaseCreate
+from app.core.deps import get_current_user
+from app.settings import settings
+
+# [???] ????? ????
+router = APIRouter()
+
+
+# ---------------------------------------------------------
+# 1. System Info (??? ???: /system/version)
+# ---------------------------------------------------------
+@router.get("/system/version", response_model=SystemVersion)
+def get_version():
+    return {
+        "version": settings.VERSION,
+        "status": "running",
+        "timezone": settings.TIMEZONE
+    }
+
+
+# ---------------------------------------------------------
+# 2. Reports (???: /reports/...)
+# ---------------------------------------------------------
+@router.get("/reports/history", response_model=List[ReportHistoryItem])
+def get_report_history(
+        days: int = 10,
+        db: Session = Depends(get_db),
+        current_user: User = Depends(get_current_user)
+):
+    """??? N????? ????? ??? ???? ???"""
+    history = db.query(ReportNotification).filter(
+        ReportNotification.user_id == current_user.id
+    ).order_by(ReportNotification.report_date.desc()).limit(days).all()
+
+    return [
+        ReportHistoryItem(
+            report_date=h.report_date,
+            upload_status=h.upload_status,
+            primary_status=h.primary_status,
+            sent_at=h.updated_at
+        ) for h in history
+    ]
+
+
+@router.get("/reports/history/{report_date}", response_model=ReportDetailResponse)
+def get_report_detail(
+        report_date: date,
+        db: Session = Depends(get_db),
+        current_user: User = Depends(get_current_user)
+):
+    """??? ??￥ ??? ??"""
+    noti = db.query(ReportNotification).filter(
+        ReportNotification.user_id == current_user.id,
+        ReportNotification.report_date == report_date
+    ).first()
+
+    if not noti:
+        raise HTTPException(status_code=404, detail="No report found for this date")
+
+    return ReportDetailResponse(
+        report_date=noti.report_date,
+        upload_status=noti.upload_status,
+        primary_status=noti.primary_status,
+        sent_at=noti.updated_at,
+        primary_body=noti.primary_body,
+        error_message=noti.error_message
+    )
+
+
+# ---------------------------------------------------------
+# 3. Releases (???: /releases)
+# ---------------------------------------------------------
+@router.get("/releases", response_model=List[ReleaseInfo])
+def get_releases(db: Session = Depends(get_db)):
+    return db.query(Release).order_by(Release.id.desc()).all()
+
+
+@router.post("/releases", response_model=ReleaseInfo, status_code=201)
+def create_release(
+        release_in: ReleaseCreate,
+        db: Session = Depends(get_db),
+        current_user: User = Depends(get_current_user)
+):
+    if current_user.role != "ADMIN":
+        raise HTTPException(status_code=403, detail="Only admins can publish releases")
+
+    existing = db.query(Release).filter(Release.version == release_in.version).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="Version already exists")
+
+    new_release = Release(
+        version=release_in.version,
+        description=release_in.description,
+        download_url=release_in.download_url,
+        is_mandatory=release_in.is_mandatory
+    )
+    db.add(new_release)
+    db.commit()
+    db.refresh(new_release)
+    return new_release
+
+
+==============================================================================
+?? FILE: \app\routers\users.py
+==============================================================================
+from fastapi import APIRouter, Depends
+from sqlalchemy.orm import Session
+from app.db import get_db
+from app.schemas.user_schema import UserResponse, UserUpdate
+from app.models.models import User
+from app.controllers.user_controller import UserController
+
+# [FIX] ??줄이 ??어????러가 ??습??다. 반드??추????주??요.
+from app.core.deps import get_current_user
+
+router = APIRouter()
+
+@router.get("/me", response_model=UserResponse)
+def read_users_me(current_user: User = Depends(get_current_user)):
+    """
+    ????보 조회 (Authentication ??수)
+    """
+    return UserController.get_me(current_user)
+
+@router.put("/profile", response_model=UserResponse)
+def update_user_profile(
+    user_in: UserUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    ??로????정 (Authentication ??수)
+    """
+    return UserController.update_profile(db, current_user, user_in)
+
+
+==============================================================================
+?? FILE: \app\routers\__init__.py
+==============================================================================
+
+
+==============================================================================
+?? FILE: \app\schemas\sales_schema.py
+==============================================================================
+# app/schemas/sales_schema.py
+from pydantic import BaseModel
+from datetime import date
+from typing import List, Dict
+
+class SalesReportResponse(BaseModel):
+    report_id: int
+    report_date: date
+    hall: int
+    baemin: int
+    coupang: int
+    yogiyo: int
+    total_sales: int
+
+    class Config:
+        from_attributes = True
+
+# [A5 추??] ??별 조회??
+class MonthlySalesSummary(BaseModel):
+    date: str       # "2025-01-01"
+    total_sales: int
+    platform_sales: Dict[str, int] # {"baemin": 1000, ...}
+
+class MonthlySalesResponse(BaseModel):
+    month: str      # "2025-01"
+    total_accumulated: int
+    daily_logs: List[MonthlySalesSummary]
+
+
+==============================================================================
+?? FILE: \app\schemas\system.py
+==============================================================================
+from pydantic import BaseModel
+from typing import Optional, List
+from datetime import date, datetime
+
+
+class SystemVersion(BaseModel):
+    version: str
+    status: str
+    timezone: str
+
+
+class HeartbeatResponse(BaseModel):
+    status: str
+    last_heartbeat: str
+
+
+# [A5] ????? ???
+class ReportHistoryItem(BaseModel):
+    report_date: date
+    upload_status: str
+    primary_status: str
+    sent_at: Optional[datetime]
+
+
+class ReportDetailResponse(ReportHistoryItem):
+    primary_body: Optional[str]
+    error_message: Optional[str]
+
+
+# [A5] ?????? ????
+class ReleaseInfo(BaseModel):
+    version: str
+    description: Optional[str]
+    download_url: str
+    is_mandatory: bool
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class ReleaseCreate(BaseModel):
+    version: str
+    # [????] = None ?? ?????? ??????? ???? ?????? ???? ??? ??
+    description: Optional[str] = None
+    download_url: str
+    is_mandatory: bool = False
+
+
+==============================================================================
+?? FILE: \app\schemas\user_schema.py
+==============================================================================
+from pydantic import BaseModel
+from datetime import datetime
+from typing import Optional
+
+# [????]
+class UserBase(BaseModel):
+    username: str
+    phone: str
+    store_name: str
+
+class UserCreate(UserBase):
+    password: str
+
+class UserResponse(UserBase):
+    id: int
+    store_uuid: str
+    created_at: datetime
+    class Config:
+        from_attributes = True
+
+# [NEW] ?α??? ?? ???
+class UserLogin(BaseModel):
+    username: str
+    password: str
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+
+
+# app/schemas/user_schema.py (???? ???? ????? ???)
+
+class UserUpdate(BaseModel):
+    phone: Optional[str] = None
+    store_name: Optional[str] = None
+
+    # ?? ?? ???(username, role ??)?? ?????? ?????? ???? ????????? ????
+    # ????? "???? ???"?? ????? ??? ????, Pydantic ???????? ?????????.
+    class Config:
+        extra = "forbid"  # ??????? ???? ??? ???? 422 Unprocessable Entity ??? (???? ???)
+
+
+==============================================================================
+?? FILE: \app\schemas\__init__.py
+==============================================================================
+
+
+==============================================================================
+?? FILE: \app\services\monitoring.py
+==============================================================================
+# app/services/monitoring.py
+from datetime import datetime, timedelta
+from sqlalchemy.orm import Session
+from app.models.models import User, SystemLog
+from app.db import SessionLocal
+from app.settings import settings
+from app.services.notification import NotificationService  # [추??] ??제 발송????해 ??포??
+
+
+class MonitoringService:
+    @staticmethod
+    def log_event(db: Session, type: str, level: str, message: str, meta: str = None):
+        """??스??로그 ??재 ??퍼"""
+        try:
+            log = SystemLog(
+                type=type,
+                level=level,
+                source="SERVER",
+                message=message,
+                status="SUCCESS",
+                meta=meta
+            )
+            db.add(log)
+            # ??기??commit ???? ??음 (??출???? ??괄 commit ??도??
+        except Exception as e:
+            print(f"[Log Error] {e}")
+
+    @staticmethod
+    def send_zombie_alert(db: Session, user: User):
+        """
+        ??제 Solapi SMS 발송 로직 ??동
+        """
+        # NotificationService??구현??'??전????턴'??SMS 발송 로직????출??니??
+        # ??공 ??True, ??패 ??False 반환
+        return NotificationService.send_zombie_alert(db, user)
+
+    @staticmethod
+    def check_zombies():
+        """
+        주기??으????행??어 5????상 ??트비트가 ??는 ??????감????니??
+        """
+        db = SessionLocal()
+        try:
+            # 기??: ??재??간 - 5??
+            threshold = datetime.now() - timedelta(minutes=60)
+
+            # ??버?? ??버 ??간 ??인
+            # print(f"[Monitoring] Checking at {datetime.now()} (Threshold: {threshold})")
+
+            # 조건: ??트비트가 5????이??+ ??직 ??림????보낸(is_offline_notified=False) ????
+            zombies = db.query(User).filter(
+                User.last_heartbeat < threshold,
+                User.is_offline_notified == False
+            ).all()
+
+            if zombies:
+                print(f"[Monitoring] Detected {len(zombies)} zombies.")
+
+            for user in zombies:
+                # 1. SMS 발송 ??도 (NotificationService ??임)
+                # db ??션??같이 ??겨????스??로그????길 ????게 ??
+                sent = MonitoringService.send_zombie_alert(db, user)
+
+                if sent:
+                    # 2. ??공 ????태 ??데??트 (중복 발송 방??)
+                    user.is_offline_notified = True
+                    db.add(user)
+
+                    # 3. 추?? 로그 ??재 (A3 ??구??항)
+                    MonitoringService.log_event(
+                        db,
+                        type="ZOMBIE_SMS",
+                        level="WARN",
+                        message=f"Zombie detected & Sent: {user.username} ({user.store_name})",
+                        meta=f'{{"user_id": {user.id}}}'
+                    )
+                else:
+                    # ??패 ??로그????기?? is_offline_notified??False ???? (??음 주기????시??
+                    print(f"[Monitoring] Failed to send SMS to {user.store_name}")
+
+            # 변경사????괄 ????
+            db.commit()
+
+        except Exception as e:
+            print(f"[Monitoring Error] {e}")
+            db.rollback()
+        finally:
+            db.close()
+
+    @staticmethod
+    def daily_reset():
+        """
+        [명세] ??루 1??Zombie SMS + 00:05 리셋
+        00:05????행??어 ??림 ??태??초기??합??다.
+        """
+        print("[Scheduler] Daily Reset Logic Executed at 00:05")
+
+        db = SessionLocal()
+        try:
+            # 모든 ????????림 ??태??초기??(??일 ??시 ??림 받을 ????게)
+            db.query(User).update({User.is_offline_notified: False})
+            db.commit()
+            print("[Scheduler] All users' offline status reset to False.")
+        except Exception as e:
+            print(f"[Reset Error] {e}")
+            db.rollback()
+        finally:
+            db.close()
+
+
+==============================================================================
+?? FILE: \app\services\notification.py
+==============================================================================
+import requests
+import json
+import datetime
+import hmac
+import hashlib
+import uuid
+from sqlalchemy.orm import Session
+from app.models.models import ReportNotification, User, SalesReport, SystemLog
+from app.settings import settings
+
+
+class NotificationService:
+    # ------------------------------------------------------------------
+    # [1] ??림??관??로직 (??일 매출 보고 -> 관리자??게 ??송)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _get_solapi_header():
+        """??림??용 ??더 ??성??""
+        date_str = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        salt = str(uuid.uuid4())
+        data = date_str + salt
+        signature = hmac.new(
+            key=settings.SOLAPI_SECRET.encode("utf-8"),
+            msg=data.encode("utf-8"),
+            digestmod=hashlib.sha256
+        ).hexdigest()
+        return {
+            "Authorization": f"HMAC-SHA256 apiKey={settings.SOLAPI_KEY}, date={date_str}, salt={salt}, signature={signature}",
+            "Content-Type": "application/json"
+        }
+
+    @staticmethod
+    def send_daily_report(db: Session, user: User, report: SalesReport):
+        """
+        [??일 매출 보고] -> ??림??
+        ??신?? settings.MANAGER_PHONE (관리자)
+        """
+        body = (
+            f"[{user.store_name}] {report.report_date} ??일매출\n"
+            f"??: {report.total_sales:,}\n\n"
+            f"?? : {report.hall:,}\n"
+            f"배?? : {report.baemin:,}\n"
+            f"쿠팡 : {report.coupang:,}\n"
+            f"??기??: {report.yogiyo:,}\n"
+            f"??니??"
+        )
+
+        # ???? 보낸 ??력????는지 ??인
+        notif = db.query(ReportNotification).filter(
+            ReportNotification.user_id == user.id,
+            ReportNotification.report_date == report.report_date
+        ).first()
+
+        if not notif:
+            notif = ReportNotification(
+                user_id=user.id,
+                report_date=report.report_date,
+                upload_status="RECEIVED",
+                primary_channel="ALIMTALK"
+            )
+            db.add(notif)
+
+        try:
+            # ??림??발송 로직
+            url = "https://api.solapi.com/messages/v4/send"
+            headers = NotificationService._get_solapi_header()
+            data = {
+                "message": {
+                    "to": settings.MANAGER_PHONE,  # [????] 매출 리포??는 관리자??게
+                    "from": settings.SENDER_PHONE,
+                    "text": body,
+                    "kakaoOptions": {
+                        "pfId": settings.KAKAO_PF_ID,
+                        "templateId": settings.KAKAO_TEMPLATE_ID,
+                        "disableSms": True
+                    }
+                }
+            }
+            resp = requests.post(url, headers=headers, json=data).json()
+
+            notif.primary_status = "SENT"
+            notif.primary_body = body
+            notif.provider_message_id = resp.get("messageId")
+            notif.updated_at = datetime.datetime.now()
+
+            # ??스??로그 기록
+            db.add(SystemLog(type="ALIMTALK", level="INFO", source="SERVER", message="Daily report sent",
+                             status="SUCCESS"))
+            print(f"[ALIMTALK SUCCESS] MessageId: {resp.get('messageId')}")
+
+        except Exception as e:
+            error_msg = str(e)
+            notif.primary_status = "FAIL"
+            notif.error_message = error_msg
+            notif.updated_at = datetime.datetime.now()
+
+            db.add(
+                SystemLog(type="ALIMTALK", level="ERROR", source="SERVER", message=f"Fail: {error_msg}", status="FAIL"))
+            print(f"[ALIMTALK FAIL] {error_msg}")
+
+        db.commit()
+
+    # ------------------------------------------------------------------
+    # [2] 좀????림 로직 (PC 꺼짐 감?? -> ??장??에????송)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def send_zombie_alert(db: Session, user: User):
+        """
+        [좀????????림]
+        ??신?? user.phone (??당 매장 ??장??
+        """
+        print(f"\n=== ??? 좀????림 발송 ??작 (To Owner) ===")
+
+        # [??전??치] ??장????화번호가 ??는 경우 처리
+        if not user.phone:
+            error_msg = f"User {user.username} ({user.store_name}) has no phone number."
+            print(f"[ZOMBIE FAIL] {error_msg}")
+            db.add(SystemLog(type="ZOMBIE_SMS", level="ERROR", source="SERVER", message=error_msg, status="FAIL"))
+            db.commit()
+            return False
+
+        # [메시지 ??용]
+        text_body = f"[{user.store_name}] 베????이가 종료??었??니?? ??시 켜주??요."
+
+        try:
+            # (1) ??더 ??성
+            date_str = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            salt = str(uuid.uuid4())
+            data = date_str + salt
+            signature = hmac.new(
+                key=settings.SOLAPI_SECRET.encode("utf-8"),
+                msg=data.encode("utf-8"),
+                digestmod=hashlib.sha256
+            ).hexdigest()
+
+            headers = {
+                "Authorization": f"HMAC-SHA256 apiKey={settings.SOLAPI_KEY}, date={date_str}, salt={salt}, signature={signature}",
+                "Content-Type": "application/json"
+            }
+
+            # (2) ??이로드 구성
+            body = {
+                "message": {
+                    "to": user.phone,  # [??정?? ??장??본인 ??????번호
+                    "from": settings.SENDER_PHONE,  # 발신??는 ??정??번호 (????번????
+                    "text": text_body,
+                    "type": "SMS"
+                }
+            }
+
+            # [??버??
+            print(f"   - From: {settings.SENDER_PHONE}")
+            print(f"   - To: {user.phone} (??장??")
+            print(f"   - Text: {text_body}")
+
+            # (3) 발송
+            url = "https://api.solapi.com/messages/v4/send"
+            res = requests.post(url, headers=headers, json=body)
+
+            if res.status_code != 200:
+                raise Exception(f"Solapi API Error: {res.text}")
+
+            resp = res.json()
+
+            # 로그 기록
+            db.add(SystemLog(
+                type="ZOMBIE_SMS",
+                level="WARN",
+                source="SERVER",
+                message=f"Zombie Alert sent to {user.store_name}",
+                status="SUCCESS",
+                meta=f'{{"user_id": {user.id}, "phone": "{user.phone}"}}'
+            ))
+            db.commit()
+            print(f"[ZOMBIE SMS SUCCESS] MessageId: {resp.get('messageId')}")
+            return True
+
+        except Exception as e:
+            print(f"[ZOMBIE SMS FAIL] {str(e)}")
+            db.add(SystemLog(type="ZOMBIE_SMS", level="ERROR", source="SERVER", message=str(e), status="FAIL"))
+            db.commit()
+            return False
+
+
+==============================================================================
+?? FILE: \app\services\parser.py
+==============================================================================
+import io
+import msoffcrypto
+import pandas as pd
+import openpyxl
+from datetime import date, datetime  # [추??] ??짜 비교??
+from fastapi import UploadFile, HTTPException
+from app.settings import settings
+
+
+class ExcelParser:
+    @staticmethod
+    async def parse_sales_file(file: UploadFile):
+        # 1. ??일 준??
+        file_content = await file.read()
+        file_io = io.BytesIO(file_content)
+        decrypted = io.BytesIO()
+        try:
+            office_file = msoffcrypto.OfficeFile(file_io)
+            office_file.load_key(password=settings.EXCEL_PASSWORD)
+            office_file.decrypt(decrypted)
+            decrypted.seek(0)
+        except Exception:
+            file_io.seek(0)
+            decrypted = file_io
+
+        # 2. ???? ??기
+        try:
+            df = pd.read_excel(decrypted, sheet_name=settings.EXCEL_SHEET_NAME, header=None)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Excel parsing error: {str(e)}")
+
+        # 3. ??더 찾기 (??워??기반)
+        header_row_idx = -1
+        keywords = ["카드", "??금", "배??", "배달", "쿠팡", "??기??, "??체", "KB???카드", "??한카드", "비씨카드"]
+
+        for r_idx, row in df.iterrows():
+            row_str = " ".join([str(val) for val in row if pd.notna(val)])
+            if any(k in row_str for k in keywords):
+                header_row_idx = r_idx
+                break
+
+        if header_row_idx == -1:
+            for r_idx, row in df.iterrows():
+                if "매입??별" in " ".join([str(val) for val in row if pd.notna(val)]):
+                    if r_idx + 1 < len(df):
+                        header_row_idx = r_idx + 1
+                        break
+            if header_row_idx == -1:
+                raise HTTPException(status_code=400, detail="Cannot find header row.")
+
+        # 4. ??이????추출
+        if header_row_idx + 1 >= len(df):
+            return {"hall": 0, "baemin": 0, "coupang": 0, "yogiyo": 0}
+
+        header_row = df.iloc[header_row_idx]
+
+        # [NEW] ??이????짜 검??로직 ??작 =================================
+        # ??더 바로 ??랫줄이 ??이??라??가??하?? ??번째 컬럼(0??????짜????인
+        data_row = df.iloc[header_row_idx + 1]
+
+        try:
+            raw_date = data_row[0]  # ??번째 ??가??오??
+            excel_date = None
+
+            # 1) ???? ??짜 ??식??면 그??????용
+            if isinstance(raw_date, (pd.Timestamp, datetime, date)):
+                excel_date = raw_date.date() if isinstance(raw_date, (pd.Timestamp, datetime)) else raw_date
+
+            # 2) 문자??이????싱 ??도 ("2026-01-12" or "2026.01.12")
+            elif isinstance(raw_date, str):
+                clean_date_str = raw_date.strip().replace('.', '-')
+                excel_date = datetime.strptime(clean_date_str, "%Y-%m-%d").date()
+
+            # 3) 검?? ???? ??짜 vs ??늘 ??짜
+            if excel_date:
+                server_today = date.today()
+                if excel_date != server_today:
+                    print(f"????짜 불일??차단! ????: {excel_date}, ??버: {server_today}")
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Report date mismatch. File date: {excel_date}, Today: {server_today}"
+                    )
+                else:
+                    print(f"????짜 검????과: {excel_date}")
+
+        except HTTPException as he:
+            raise he  # 불일????러??그??????짐
+        except Exception as e:
+            # ??짜 ??싱 ??패 ?? ??단 경고????고 ??어가거나, ??책????라 막을 ??도 ??음
+            # ??기??는 ??전??게 로그??찍고 ??어갑니?? (??식?????? ????으므??
+            print(f"??? ??짜 ??싱 ??패 (검??건너??): {e}")
+        # =================================================================
+
+        # 5. ??이????싱 ????산
+        result = {"hall": 0, "baemin": 0, "coupang": 0, "yogiyo": 0}
+
+        for i in range(header_row_idx + 1, len(df)):
+            data_row = df.iloc[i]
+            row_str = " ".join([str(v) for v in data_row if pd.notna(v)])
+            if not row_str or "??계" in row_str or "??계" in row_str: continue
+
+            for col_idx in range(len(header_row)):
+                col_name = str(header_row[col_idx]).strip()
+                raw_val = data_row[col_idx]
+
+                if pd.isna(col_name) or pd.isna(raw_val) or col_name == 'nan': continue
+
+                # 중복 컬럼 블랙리스??
+                if col_name in ["카드", "QR결제", "??용카드", "결제??계"]: continue
+                if "금액" in col_name or "건수" in col_name or "총계" in col_name: continue
+
+                # 금액 변??
+                amount = 0
+                try:
+                    if isinstance(raw_val, (int, float)):
+                        amount = int(raw_val)
+                    else:
+                        clean_str = str(raw_val).replace(",", "").replace("??, "").strip()
+                        if clean_str.lstrip('-').isdigit():
+                            amount = int(clean_str)
+                except:
+                    continue
+
+                if amount == 0: continue
+
+                # 분류 로직
+                if "배달?????? in col_name or "배??" in col_name:
+                    result["baemin"] += amount
+                elif "쿠팡" in col_name or "coupang" in col_name:
+                    result["coupang"] += amount
+                elif "??기?? in col_name or "yogiyo" in col_name:
+                    result["yogiyo"] += amount
+                else:
+                    result["hall"] += amount
+
+        return result
+
+
+==============================================================================
+?? FILE: \app\services\__init__.py
+==============================================================================
+
+
+
